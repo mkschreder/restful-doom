@@ -10,6 +10,7 @@
 #include "api_agent.h"
 #include "api_player_controller.h"
 #include "api_object_controller.h"
+#include "api_route.h"
 #include "d_player.h"
 #include "doomstat.h"
 #include "g_game.h"
@@ -682,6 +683,37 @@ static void DescribeExit(cJSON *root)
             else
             {
                 cJSON_Delete(spot);
+            }
+        }
+
+
+        // The way a player would actually WALK there: how many rooms away the
+        // exit is, and the bearing to the next doorway on the route. The
+        // straight-line bearing above is kept because it is what a player
+        // facing the right way sees, but it points through walls and an agent
+        // that followed it pressed against them - see api_route.c.
+        {
+            api_route_t route;
+
+            if (API_Route(player, &route))
+            {
+                cJSON_AddNumberToObject(o, "pathDistance", route.cells * 32);
+                if (route.have_step)
+                {
+                    angle_t ra = R_PointToAngle2(player->x, player->y, route.x, route.y);
+                    int rrel = angleToDegrees(ra - player->angle);
+
+                    if (rrel > 180)
+                    {
+                        rrel -= 360;
+                    }
+                    cJSON_AddNumberToObject(o, "routeBearing", rrel);
+                    cJSON_AddNumberToObject(
+                        o, "routeDistance",
+                        (int)API_FixedToFloat(P_AproxDistance(player->x - route.x,
+                                                              player->y - route.y)));
+                    cJSON_AddNumberToObject(o, "routeClearance", Clearance(player, rrel));
+                }
             }
         }
 

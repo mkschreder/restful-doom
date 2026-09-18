@@ -82,6 +82,7 @@ api_world_controller.c api_world_controller.h \
 api_door_controller.c api_door_controller.h \
 api_object_controller.c api_object_controller.h \
 api_agent.c             api_agent.h \
+api_route.c             api_route.h \
 api_obj_descriptions.c
 
 libdoom_a_SOURCES = $(SOURCE_FILES)                   \
