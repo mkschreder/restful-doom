@@ -1,10 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <SDL_net.h>
 #include <math.h>
 
 #include "api.h"
+#include "../m_misc.h"
 #include "d_player.h"
 #include "m_menu.h"
 #include "../d_event.h"
@@ -17,7 +19,6 @@
 
 
 extern api_obj_description_t api_descriptors[];
-char path[100];
 char hud_message[512];
 
 int keys_down[NUMKEYS];
@@ -27,10 +28,32 @@ TCPsocket server_sd;
 TCPsocket client_sd;
 SDLNet_SocketSet set;
 
+// ----
+//  HTTP transport
+//
+//  One client at a time: this is a control channel for one agent, not a web
+//  server. Requests are accumulated into req_buf until a COMPLETE one is
+//  present (headers plus Content-Length bytes of body) - a request is not
+//  assumed to arrive in a single recv(), because a JSON body larger than the
+//  path MTU does not.
+// ----
+
+#define API_REQ_MAX 65536
+
+static char req_buf[API_REQ_MAX + 1];
+static int req_len;
+static boolean client_open;
+static boolean client_keepalive;
+
+// Log one line per request. Off by default: a lockstep agent issues one
+// request per game tic, and the access log is then the dominant cost of a
+// training run as well as the dominant content of its stdout.
+boolean api_verbose;
+
 void API_AfterTic();
 boolean API_ParseRequest(char *buffer, int buffer_len, api_request_t *request);
 api_response_t API_RouteRequest(api_request_t request);
-void API_SendResponse(api_response_t resp);
+static void API_CloseClient(void);
 
 // externally-defined game variables
 extern player_t players[MAXPLAYERS];
@@ -64,6 +87,11 @@ void API_Init(int port)
         fprintf(stderr, "Error: SDLNet_AllocSocketSet: %s\n", SDLNet_GetError());
         exit(EXIT_FAILURE); 
     }
+    // The LISTENING socket is in the set too, so a blocking wait wakes on an
+    // incoming connection instead of having to poll for one.
+    SDLNet_TCP_AddSocket(set, server_sd);
+
+    api_verbose = M_CheckParm("-apiverbose") > 0;
 
     for (int i = 0; i < NUMKEYS; i++) {
         keys_down[i] = -1;
@@ -73,48 +101,296 @@ void API_Init(int port)
     printf("API_Init: Listening for connections on %s:%d\n", host, port);
 }
 
-void API_RunIO()
+// Close the client connection and discard whatever it had buffered.
+static void API_CloseClient(void)
 {
-    TCPsocket csd;
-    int recv_len = 0;
-    char buffer[1024];
-    IPaddress *remote_ip;
-    const char *ip_str;
-
-    if ((csd = SDLNet_TCP_Accept(server_sd)))
+    if (client_open)
     {
-        client_sd = csd;
-        SDLNet_TCP_AddSocket(set, client_sd);
+        SDLNet_TCP_DelSocket(set, client_sd);
+        SDLNet_TCP_Close(client_sd);
+        client_open = false;
+    }
+    req_len = 0;
+}
+
+// Accept a pending connection, replacing any client already attached.
+static void API_AcceptClient(void)
+{
+    TCPsocket csd = SDLNet_TCP_Accept(server_sd);
+
+    if (!csd)
+    {
+        return;
+    }
+    if (client_open)
+    {
+        API_CloseClient();
+    }
+    client_sd = csd;
+    SDLNet_TCP_AddSocket(set, client_sd);
+    client_open = true;
+    client_keepalive = true;
+    req_len = 0;
+}
+
+// Header field lookup, line by line and case-insensitively, because a header
+// name's case is not significant and a client is free to send any of them.
+static char *API_FindHeader(char *head, int head_len, const char *name)
+{
+    int name_len = strlen(name);
+    char *p = head;
+    char *end = head + head_len;
+
+    while (p < end)
+    {
+        char *eol = memchr(p, '\n', end - p);
+        int line_len = eol ? (int)(eol - p) : (int)(end - p);
+
+        if (line_len >= name_len && strncasecmp(p, name, name_len) == 0)
+        {
+            return p + name_len;
+        }
+        if (!eol)
+        {
+            break;
+        }
+        p = eol + 1;
+    }
+    return NULL;
+}
+
+// Total byte length of the complete request at the head of req_buf, or -1 if
+// what has arrived so far is not yet a whole one.
+static int API_RequestBytes(void)
+{
+    char *hdr_end;
+    char *value;
+    int head_len;
+    int body_len = 0;
+
+    req_buf[req_len] = 0;
+    hdr_end = strstr(req_buf, "\r\n\r\n");
+    if (hdr_end == NULL)
+    {
+        return -1;
+    }
+    head_len = (int)(hdr_end - req_buf) + 4;
+
+    value = API_FindHeader(req_buf, head_len, "Content-Length:");
+    if (value != NULL)
+    {
+        body_len = atoi(value);
+        if (body_len < 0)
+        {
+            body_len = 0;
+        }
+    }
+    if (req_len < head_len + body_len)
+    {
+        return -1;
+    }
+    return head_len + body_len;
+}
+
+static void API_ReadMore(void)
+{
+    int n;
+
+    if (req_len >= API_REQ_MAX)
+    {
+        // A request that cannot fit is not a request we can answer; dropping
+        // the connection is the only honest response, and leaving the bytes
+        // in the buffer would wedge the loop forever.
+        printf("API: request exceeds %d bytes, dropping connection\n", API_REQ_MAX);
+        API_CloseClient();
+        return;
+    }
+    n = SDLNet_TCP_Recv(client_sd, req_buf + req_len, API_REQ_MAX - req_len);
+    if (n <= 0)
+    {
+        API_CloseClient();
+        return;
+    }
+    req_len += n;
+}
+
+// Wait up to timeout_ms for a complete request to be buffered. A negative
+// timeout waits indefinitely. Returns whether one is now available.
+//
+// Both the listening socket and the client socket are in the socket set, so a
+// blocking wait wakes on a new CONNECTION as well as on new data - otherwise
+// the first request of a run could only be noticed by polling.
+boolean API_Poll(int timeout_ms)
+{
+    for (;;)
+    {
+        boolean progress = false;
+
+        if (API_RequestBytes() > 0)
+        {
+            return true;
+        }
+        if (SDLNet_CheckSockets(set, timeout_ms < 0 ? 100 : timeout_ms) > 0)
+        {
+            if (SDLNet_SocketReady(server_sd))
+            {
+                API_AcceptClient();
+                progress = true;
+            }
+            if (client_open && SDLNet_SocketReady(client_sd))
+            {
+                API_ReadMore();
+                progress = true;
+            }
+        }
+        if (timeout_ms >= 0 && !progress)
+        {
+            return API_RequestBytes() > 0;
+        }
+    }
+}
+
+static const char *API_StatusText(int status)
+{
+    switch (status)
+    {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 400: return "Bad Request";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 500: return "Internal Server Error";
+        default:  return "Unknown";
+    }
+}
+
+static boolean API_SendAll(const char *data, int len)
+{
+    int sent = 0;
+
+    while (sent < len)
+    {
+        int n = SDLNet_TCP_Send(client_sd, (void *)(data + sent), len - sent);
+        if (n <= 0)
+        {
+            API_CloseClient();
+            return false;
+        }
+        sent += n;
+    }
+    return true;
+}
+
+void API_SendResponse(api_response_t resp)
+{
+    char header[256];
+    char *body = NULL;
+    int body_len = 0;
+    int hdr_len;
+
+    if (!client_open)
+    {
+        if (resp.json)
+        {
+            cJSON_Delete(resp.json);
+        }
+        return;
     }
 
-    if (SDLNet_CheckSockets(set, 0) > 0)
+    if (resp.json)
     {
-        recv_len = SDLNet_TCP_Recv(client_sd, buffer, 1024);
-        if (recv_len > 0)
-        {
-            api_request_t request;
-            api_response_t response;
-            if (API_ParseRequest(buffer, recv_len, &request)) {
-                char msg[512];
-                snprintf(msg, 512, "%s %s", request.method, request.full_path);
-                API_SetHUDMessage(msg);
-                response = API_RouteRequest(request);
-            }
-            else 
-            {
-                response = API_CreateErrorResponse(400, "invalid request");
-            }
+        // Unformatted: a lockstep agent reads one of these per tic and never
+        // looks at the wire bytes, so the pretty-printer's whitespace is pure
+        // cost. Anything reading them by hand can pipe through a formatter.
+        body = cJSON_PrintUnformatted(resp.json);
+        body_len = body ? (int)strlen(body) : 0;
+    }
 
-            API_SendResponse(response);
+    hdr_len = snprintf(header, sizeof(header),
+                       "HTTP/1.1 %d %s\r\n"
+                       "Content-Type: application/json\r\n"
+                       "Content-Length: %d\r\n"
+                       "Access-Control-Allow-Origin: *\r\n"
+                       "Connection: %s\r\n"
+                       "\r\n",
+                       resp.status_code, API_StatusText(resp.status_code),
+                       body_len, client_keepalive ? "keep-alive" : "close");
 
-            // access log
-            remote_ip = SDLNet_TCP_GetPeerAddress(client_sd);
-            ip_str = SDLNet_ResolveIP(remote_ip);
-            printf("access_log: %s - - - \"%s %s\" %d\n", ip_str, request.method, request.full_path, response.status_code);
+    API_SendAll(header, hdr_len);
+    if (body_len > 0)
+    {
+        API_SendAll(body, body_len);
+    }
+    if (body)
+    {
+        free(body);
+    }
+    if (resp.json)
+    {
+        cJSON_Delete(resp.json);
+    }
+    if (!client_keepalive)
+    {
+        API_CloseClient();
+    }
+}
 
-            SDLNet_TCP_DelSocket(set, client_sd);
-            SDLNet_TCP_Close(client_sd);
-        }
+// Serve the complete request at the head of req_buf.
+void API_ServeRequest(void)
+{
+    api_request_t request;
+    api_response_t response;
+    int total = API_RequestBytes();
+    char saved;
+    char *value;
+
+    if (total <= 0)
+    {
+        return;
+    }
+
+    // Terminate exactly at the end of THIS request: the buffer may already
+    // hold the next one (pipelining), and the parser works on C strings.
+    saved = req_buf[total];
+    req_buf[total] = 0;
+
+    value = API_FindHeader(req_buf, total, "Connection:");
+    client_keepalive = !(value != NULL && strcasestr(value, "close") != NULL);
+
+    if (API_ParseRequest(req_buf, total, &request))
+    {
+        response = API_RouteRequest(request);
+    }
+    else
+    {
+        response = API_CreateErrorResponse(400, "invalid request");
+        request.method[0] = 0;
+        request.full_path[0] = 0;
+    }
+
+    req_buf[total] = saved;
+    memmove(req_buf, req_buf + total, req_len - total);
+    req_len -= total;
+
+    if (api_verbose)
+    {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "%s %s", request.method, request.full_path);
+        API_SetHUDMessage(msg);
+        printf("access_log: \"%s %s\" %d\n", request.method, request.full_path,
+               response.status_code);
+    }
+
+    API_SendResponse(response);
+}
+
+void API_RunIO()
+{
+    if (API_Poll(0))
+    {
+        API_ServeRequest();
     }
 
     API_AfterTic();
@@ -128,15 +404,19 @@ boolean API_ParseRequest(char *buffer, int buffer_len, api_request_t *request)
     char *http_entity_body;
     int ret;
 
-    buffer[buffer_len] = 0;
-    ret = sscanf(buffer, "%s%s%s", method, path, protocol);
+    // Field widths, because a request line is attacker-controlled input and
+    // the destinations are fixed-size: an unbounded %s here wrote past both
+    // `method` and the 100-byte global `path` on any long request.
+    ret = sscanf(buffer, "%9s %511s %9s", method, request->path, protocol);
     if (ret != 3) {
         return false;
     }
 
-    strncpy(request->full_path, path, 512);
+    M_StringCopy(request->full_path, request->path, sizeof(request->full_path));
 
-    if (-1 == yuarel_parse(&url, path)) {
+    // Parses IN PLACE, writing terminators into request->path - which is why
+    // the buffer belongs to the request and not to this frame.
+    if (-1 == yuarel_parse(&url, request->path)) {
         return false;
     }
     http_entity_body = strstr(buffer, "\r\n\r\n");
@@ -146,7 +426,7 @@ boolean API_ParseRequest(char *buffer, int buffer_len, api_request_t *request)
     }
 
     request->url = url;
-    strncpy(request->method, method, 10);
+    M_StringCopy(request->method, method, sizeof(request->method));
     request->body = http_entity_body;
     return true;
 }
@@ -348,27 +628,6 @@ api_response_t API_RouteRequest(api_request_t req)
     return API_CreateErrorResponse(404, "Not found");
 }
 
-void API_SendResponse(api_response_t resp) {
-    char buffer[255];
-    int len;
-
-    sprintf(buffer, "HTTP/1.0 %d\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nContent-Type:application/json\r\n\r\n", resp.status_code);
-    len = strlen(buffer);
-    if (SDLNet_TCP_Send(client_sd, (void *)buffer, len) < len) {
-        printf("failed to send all bytes\n");
-    }
-    if (resp.json)
-    {
-        char *jsonToString = cJSON_Print(resp.json);
-        len = strlen(jsonToString);
-        if (SDLNet_TCP_Send(client_sd, (void *)jsonToString, len) < len) {
-            printf("failed to send all bytes\n");
-        }
-        free(jsonToString);
-        cJSON_Delete(resp.json);
-    }
-}
-
 api_response_t API_CreateErrorResponse(int status, char *message) {
   cJSON *body = cJSON_CreateObject();
   cJSON_AddStringToObject(body, "error", message);
@@ -522,7 +781,10 @@ cJSON* DescribeMObj(mobj_t *obj)
 
 void API_SetHUDMessage(char *msg)
 {
-    strncpy(hud_message, msg, 512);
+    // strncpy(dst, src, sizeof dst) does not terminate when the source is at
+    // least as long as the destination, and the result is handed straight to
+    // the status-bar drawer.
+    M_StringCopy(hud_message, msg, sizeof(hud_message));
     players[consoleplayer].message = hud_message;
 }
 

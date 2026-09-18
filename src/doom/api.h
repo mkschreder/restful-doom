@@ -21,6 +21,13 @@ extern int target_angle;
 
 void API_Init(int port);
 void API_RunIO();
+/* Wait up to timeout_ms (negative: forever) for a complete request to arrive;
+ * returns whether one is buffered. Exposed so a lockstep driver can hand the
+ * game loop over to the API between tics. */
+boolean API_Poll(int timeout_ms);
+/* Serve the buffered request. */
+void API_ServeRequest(void);
+extern boolean api_verbose;
 float API_FixedToFloat(fixed_t fixed);
 fixed_t API_FloatToFixed(float val);
 cJSON* DescribeMObj(mobj_t *obj);
@@ -35,7 +42,11 @@ typedef struct {
 
 typedef struct {
   char method[10];
+  /* The request target as received, for logging. */
   char full_path[512];
+  /* The same target, owned by the request, for yuarel to chop up in place:
+   * `url` points INTO this buffer, so it has to outlive the parse. */
+  char path[512];
   struct yuarel url;
   char *body;
 } api_request_t;
@@ -46,5 +57,6 @@ typedef struct {
 } api_response_t;
 
 api_response_t API_CreateErrorResponse(int status, char *message);
+void API_SendResponse(api_response_t resp);
 
 #endif
