@@ -204,6 +204,10 @@ void P_SetThingPosition (mobj_t* thing);
 extern boolean		floatok;
 extern fixed_t		tmfloorz;
 extern fixed_t		tmceilingz;
+// The highest floor stepped off during the last P_CheckPosition. P_TryMove
+// refuses a move that would leave a thing standing over a drop of more than
+// 24 units, so a caller reproducing that rule needs this too.
+extern fixed_t		tmdropoffz;
 
 
 extern	line_t*		ceilingline;

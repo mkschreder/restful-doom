@@ -1,3 +1,5 @@
+#include <stdlib.h>
+
 #include "api_object_controller.h"
 
 #include "d_player.h"
@@ -11,6 +13,21 @@ extern void             P_KillMobj( mobj_t* source, mobj_t* target );
 
 angle_t degreesToAngle(int degrees) {
     return ((float)degrees / 360) * ANG_MAX;
+}
+
+/* The human-readable name of a thing's type, as the API spells it. */
+const char *API_TypeName(mobj_t *t)
+{
+    int i;
+
+    for (i = 0; i < NUMDESCRIPTIONS; i++)
+    {
+        if (api_descriptors[i].id == mobjinfo[t->type].doomednum)
+        {
+            return api_descriptors[i].text;
+        }
+    }
+    return "unknown";
 }
 
 int GetInternalTypeIdFromObjectDescription(char *objectDescription)
@@ -307,24 +324,136 @@ api_response_t API_GetLineOfSightToObject(int id, int id2)
 }
 
 //API_GetCheckMove
-api_response_t API_GetCheckTraverse(int id, float x, float y)
+/* Why a move would be refused.
+ *
+ * The endpoint this replaces was named "movetest" and ran P_PathTraverse with
+ * the AUTO-AIM callback, so it answered "can the thing SEE that point" - a
+ * question a 32-unit-wide body does not care about. A ray threads a gap the
+ * player wedges in, and a ray knows nothing about step height, headroom or a
+ * corpse in the doorway. The symptom of trusting it is a route that looks
+ * authoritative while the player stands still against a wall.
+ *
+ * What follows is P_TryMove's own test, minus the move: P_CheckPosition for
+ * the box against lines and things, then the four height rules from
+ * p_map.c. The reason a move fails is reported, because "no" on its own does
+ * not tell an agent whether to open the door, find a step, or go around. */
+
+static fixed_t probe_x, probe_y;
+static mobj_t *probe_self;
+static mobj_t *probe_hit;
+
+static boolean PIT_ProbeBlocker(mobj_t *thing)
 {
-    boolean result;
-    cJSON *root;    
+    fixed_t blockdist;
+
+    if (thing == probe_self || !(thing->flags & MF_SOLID))
+    {
+        return true;
+    }
+    blockdist = thing->radius + probe_self->radius;
+    if (abs(thing->x - probe_x) >= blockdist || abs(thing->y - probe_y) >= blockdist)
+    {
+        return true;
+    }
+    probe_hit = thing;
+    return false;
+}
+
+/* The solid thing overlapping the target box, if one is what refused the move.
+ * P_CheckPosition knows this and does not keep it, and the answer is the
+ * difference between "shoot it" and "give up on this way through". */
+static mobj_t *BlockingThingAt(mobj_t *self, fixed_t x, fixed_t y)
+{
+    int xl, xh, yl, yh, bx, by;
+    fixed_t dist = self->radius + MAXRADIUS;
+
+    probe_self = self;
+    probe_x = x;
+    probe_y = y;
+    probe_hit = NULL;
+
+    xl = (x - dist - bmaporgx) >> MAPBLOCKSHIFT;
+    xh = (x + dist - bmaporgx) >> MAPBLOCKSHIFT;
+    yl = (y - dist - bmaporgy) >> MAPBLOCKSHIFT;
+    yh = (y + dist - bmaporgy) >> MAPBLOCKSHIFT;
+
+    for (bx = xl; bx <= xh; bx++)
+        for (by = yl; by <= yh; by++)
+            if (!P_BlockThingsIterator(bx, by, PIT_ProbeBlocker))
+                return probe_hit;
+    return NULL;
+}
+
+api_response_t API_GetMoveTest(int id, float x, float y)
+{
+    fixed_t tx, ty, ox, oy, oz;
+    boolean fits;
+    const char *reason = "ok";
+    boolean ok = true;
+    mobj_t *blocker = NULL;
+    cJSON *root;
     mobj_t *obj = FindObjectById(id);
-   
+
     if (!obj)
     {
         return API_CreateErrorResponse(404, "object not found");
     }
 
-    result = P_PathTraverse(obj->x, obj->y,API_FloatToFixed(x),API_FloatToFixed(y), PT_ADDLINES,PTR_AimTraverse);
-    
+    tx = API_FloatToFixed(x);
+    ty = API_FloatToFixed(y);
+
+    /* P_CheckPosition leaves its scratch state pointing at the thing and can
+     * leave the thing itself moved; the probe must not disturb the game. */
+    ox = obj->x;
+    oy = obj->y;
+    oz = obj->z;
+    fits = P_CheckPosition(obj, tx, ty);
+    obj->x = ox;
+    obj->y = oy;
+    obj->z = oz;
+
+    if (!fits)
+    {
+        ok = false;
+        blocker = BlockingThingAt(obj, tx, ty);
+        reason = blocker ? "thing" : "wall";
+    }
+    else if (tmceilingz - tmfloorz < obj->height)
+    {
+        ok = false;
+        reason = "does-not-fit";
+    }
+    else if (tmceilingz - obj->z < obj->height)
+    {
+        ok = false;
+        reason = "headroom";
+    }
+    else if (tmfloorz - obj->z > 24 * FRACUNIT)
+    {
+        ok = false;
+        reason = "step-up";
+    }
+    else if (tmfloorz - tmdropoffz > 24 * FRACUNIT)
+    {
+        ok = false;
+        reason = "dropoff";
+    }
+
     root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", id);
     cJSON_AddNumberToObject(root, "x", x);
     cJSON_AddNumberToObject(root, "y", y);
-    cJSON_AddBoolToObject(root,"result", result);
+    cJSON_AddBoolToObject(root, "ok", ok);
+    cJSON_AddStringToObject(root, "reason", reason);
+    cJSON_AddNumberToObject(root, "z", obj->z >> FRACBITS);
+    cJSON_AddNumberToObject(root, "floor", tmfloorz >> FRACBITS);
+    cJSON_AddNumberToObject(root, "ceiling", tmceilingz >> FRACBITS);
+    cJSON_AddNumberToObject(root, "dropoff", tmdropoffz >> FRACBITS);
+    if (blocker)
+    {
+        cJSON_AddNumberToObject(root, "blockedBy", blocker->id);
+        cJSON_AddStringToObject(root, "blockedByType", API_TypeName(blocker));
+    }
 
     return (api_response_t) {200, root};
 }

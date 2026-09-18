@@ -287,27 +287,12 @@ static int BearingTo(mobj_t *from, mobj_t *to)
     return rel;
 }
 
-static const char *TypeName(mobj_t *t)
-{
-    extern api_obj_description_t api_descriptors[];
-    int i;
-
-    for (i = 0; i < NUMDESCRIPTIONS; i++)
-    {
-        if (api_descriptors[i].id == mobjinfo[t->type].doomednum)
-        {
-            return api_descriptors[i].text;
-        }
-    }
-    return "unknown";
-}
-
 static cJSON *DescribeThing(mobj_t *player, mobj_t *t)
 {
     cJSON *o = cJSON_CreateObject();
 
     cJSON_AddNumberToObject(o, "id", t->id);
-    cJSON_AddStringToObject(o, "type", TypeName(t));
+    cJSON_AddStringToObject(o, "type", API_TypeName(t));
     cJSON_AddNumberToObject(o, "distance",
                             (int)API_FixedToFloat(P_AproxDistance(player->x - t->x,
                                                                   player->y - t->y)));

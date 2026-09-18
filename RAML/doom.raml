@@ -407,7 +407,13 @@ baseUri: http://localhost:6666
           description: Invalid id
         
   /movetest:
-    description: Test if an object has a clear path to move
+    description: |
+      Whether an object could stand at a point, and if not, why not.
+      This is the engine's own move test - the box against lines and things,
+      then the height rules - and not a sight ray, which answers a different
+      question and says yes to gaps a body wedges in.
+      reason is one of: ok, wall, thing, does-not-fit, headroom, step-up,
+      dropoff.
     get:
       queryParameters:
         id: 
@@ -422,7 +428,15 @@ baseUri: http://localhost:6666
             application/json:
               example: |
                 {
-                  "result": true
+                  "id": 0,
+                  "x": 1551,
+                  "y": -2448,
+                  "ok": false,
+                  "reason": "does-not-fit",
+                  "z": 0,
+                  "floor": 0,
+                  "ceiling": 0,
+                  "dropoff": 0
                 }
         404:
           description: Invalid id

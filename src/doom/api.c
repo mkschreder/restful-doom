@@ -644,7 +644,7 @@ api_response_t API_RouteRequest(api_request_t req)
                     y = atoi(params[p].val);
                 }
             }
-            return API_GetCheckTraverse(id,x,y);
+            return API_GetMoveTest(id, x, y);
         }
         return API_CreateErrorResponse(405, "Method not allowed");
     }
