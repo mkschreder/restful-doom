@@ -16,6 +16,8 @@
 #include "m_random.h"
 #include "p_local.h"
 #include "r_main.h"
+#include "r_state.h"
+#include "tables.h"
 #include "v_video.h"
 #include "w_wad.h"
 #include "z_zone.h"
@@ -474,6 +476,128 @@ static void DescribeSurroundings(cJSON *root)
     cJSON_AddItemToObject(root, "pickups", pickups);
 }
 
+// How far the player could move in a given direction before something stops
+// them, capped at AGENT_PROBE_MAX. Probed with P_CheckPosition rather than
+// reported from geometry, so a closed door, a ledge and a monster all read the
+// same way they would if the move were attempted.
+//
+// This is what makes navigation expressible to a policy that only reads text:
+// without it "advance" is a coin flip against a wall, and the observation has
+// no other way to say that a corridor exists to the left.
+#define AGENT_PROBE_MAX 320
+#define AGENT_PROBE_STEP 64
+
+static int Clearance(mobj_t *player, int bearing_deg)
+{
+    angle_t a = player->angle + degreesToAngle(bearing_deg);
+    fixed_t fx = finecosine[a >> ANGLETOFINESHIFT];
+    fixed_t fy = finesine[a >> ANGLETOFINESHIFT];
+    fixed_t ox = player->x;
+    fixed_t oy = player->y;
+    fixed_t oz = player->z;
+    int reached = 0;
+    int d;
+
+    for (d = AGENT_PROBE_STEP; d <= AGENT_PROBE_MAX; d += AGENT_PROBE_STEP)
+    {
+        fixed_t tx = ox + FixedMul(d << FRACBITS, fx);
+        fixed_t ty = oy + FixedMul(d << FRACBITS, fy);
+
+        if (!P_CheckPosition(player, tx, ty))
+        {
+            break;
+        }
+        reached = d;
+    }
+
+    // P_CheckPosition leaves the engine's "thing being moved" scratch state
+    // pointing at the probe; restoring the position keeps a probe from being
+    // observable in the game itself.
+    player->x = ox;
+    player->y = oy;
+    player->z = oz;
+    return reached;
+}
+
+static void DescribeClearance(cJSON *root)
+{
+    mobj_t *player = players[consoleplayer].mo;
+    cJSON *o;
+    static const struct { const char *name; int bearing; } dirs[] =
+    {
+        { "ahead", 0 }, { "right", 90 }, { "behind", 180 }, { "left", 270 },
+        { "aheadRight", 45 }, { "aheadLeft", 315 },
+    };
+    unsigned int i;
+
+    if (player == NULL)
+    {
+        return;
+    }
+    o = cJSON_CreateObject();
+    for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+    {
+        cJSON_AddNumberToObject(o, dirs[i].name, Clearance(player, dirs[i].bearing));
+    }
+    cJSON_AddItemToObject(root, "clearance", o);
+}
+
+// The nearest line that ends the level, as a bearing and a distance.
+//
+// A level is won by reaching its exit, and nothing else in the observation
+// says where that is - a policy reading only what is visible can clear every
+// monster and still never finish. Doom marks the exit on a linedef special:
+// 11 and 51 are switches to press, 52 and 124 are lines to walk over.
+static void DescribeExit(cJSON *root)
+{
+    mobj_t *player = players[consoleplayer].mo;
+    line_t *best = NULL;
+    fixed_t best_dist = 0;
+    int i;
+
+    if (player == NULL)
+    {
+        return;
+    }
+    for (i = 0; i < numlines; i++)
+    {
+        int sp = lines[i].special;
+        fixed_t mx, my, d;
+
+        if (sp != 11 && sp != 51 && sp != 52 && sp != 124)
+        {
+            continue;
+        }
+        mx = (lines[i].v1->x + lines[i].v2->x) / 2;
+        my = (lines[i].v1->y + lines[i].v2->y) / 2;
+        d = P_AproxDistance(player->x - mx, player->y - my);
+        if (best == NULL || d < best_dist)
+        {
+            best = &lines[i];
+            best_dist = d;
+        }
+    }
+    if (best != NULL)
+    {
+        fixed_t mx = (best->v1->x + best->v2->x) / 2;
+        fixed_t my = (best->v1->y + best->v2->y) / 2;
+        angle_t a = R_PointToAngle2(player->x, player->y, mx, my);
+        int rel = angleToDegrees(a - player->angle);
+        cJSON *o = cJSON_CreateObject();
+
+        if (rel > 180)
+        {
+            rel -= 360;
+        }
+        cJSON_AddNumberToObject(o, "distance", (int)API_FixedToFloat(best_dist));
+        cJSON_AddNumberToObject(o, "bearing", rel);
+        cJSON_AddStringToObject(o, "kind",
+                                (best->special == 11 || best->special == 51)
+                                    ? "switch" : "walkover");
+        cJSON_AddItemToObject(root, "exit", o);
+    }
+}
+
 // Whether the episode is over, and how it went. An episode ends when the
 // player dies or when the level is left - the two things this environment is
 // scored on.
@@ -506,6 +630,8 @@ static cJSON *BuildState(void)
     cJSON_AddItemToObject(root, "level", DescribeLevel());
     cJSON_AddItemToObject(root, "player", DescribeAgentPlayer());
     DescribeSurroundings(root);
+    DescribeClearance(root);
+    DescribeExit(root);
     cJSON_AddItemToObject(root, "events", DescribeEvents());
     if (events_dropped > 0)
     {

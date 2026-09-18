@@ -1,5 +1,7 @@
 #include "api.h"
 
+angle_t degreesToAngle(int degrees);
+
 api_response_t API_PostObject(cJSON *req);
 api_response_t API_GetObjects(int max_distance);
 api_response_t API_PatchObject(int id, cJSON *req);
