@@ -100,6 +100,9 @@ static boolean response_owed;
 static boolean awaiting_level;
 static int pending_seed;
 static boolean have_pending_seed;
+/* Where along the route to the exit the next episode starts, in map units.
+ * Negative leaves the player at the level's own spawn. */
+static int pending_start_distance = -1;
 static int episode_start_tic;
 
 // ---------------------------------------------------------------------------
@@ -340,6 +343,16 @@ static cJSON *DescribeAgentPlayer(void)
     int weapon = (int)p->readyweapon;
 
     cJSON_AddNumberToObject(o, "id", mo != NULL ? mo->id : -1);
+    // Whether the floor underfoot is hurting the player. A human sees the
+    // screen flash red and their health tick down; without it an agent walks
+    // across a nukage pool wondering why it is dying.
+    if (mo != NULL && mo->subsector != NULL && mo->subsector->sector != NULL)
+    {
+        int sp = mo->subsector->sector->special;
+
+        cJSON_AddBoolToObject(o, "standingInDamage",
+                              sp == 4 || sp == 5 || sp == 7 || sp == 16 || sp == 11);
+    }
     cJSON_AddNumberToObject(o, "health", p->health);
     cJSON_AddNumberToObject(o, "armor", p->armorpoints);
     if (mo != NULL)
@@ -980,6 +993,20 @@ api_response_t API_PostEpisode(cJSON *req)
         }
         skill = val->valueint;
     }
+    val = cJSON_GetObjectItem(req, "startDistance");
+    if (val != NULL)
+    {
+        if (!cJSON_IsNumber(val))
+        {
+            return API_CreateErrorResponse(400, "startDistance must be a number");
+        }
+        pending_start_distance = val->valueint;
+    }
+    else
+    {
+        pending_start_distance = -1;
+    }
+
     val = cJSON_GetObjectItem(req, "seed");
     if (val != NULL)
     {
@@ -1082,6 +1109,30 @@ void API_Agent_PerTic(void)
                 rndindex = pending_seed & 0xff;
                 prndindex = (pending_seed >> 8) & 0xff;
                 have_pending_seed = false;
+            }
+            if (pending_start_distance >= 0 && players[consoleplayer].mo != NULL)
+            {
+                fixed_t sx, sy;
+                mobj_t *mo = players[consoleplayer].mo;
+
+                /* Build the field first - the placement reads it. */
+                (void)API_Route(mo, &(api_route_t){ 0 });
+                if (API_RouteSpotAt(pending_start_distance, (unsigned int)pending_seed,
+                                    &sx, &sy))
+                {
+                    P_UnsetThingPosition(mo);
+                    mo->x = sx;
+                    mo->y = sy;
+                    P_SetThingPosition(mo);
+                    // ONFLOORZ is a SENTINEL for P_SpawnMobj, not a
+                    // coordinate: assigning it puts the player at INT_MIN and
+                    // the next tic walks off the bottom of the world. The
+                    // floor has to be read from the sector actually landed in,
+                    // which is only known after the relink above.
+                    mo->z = mo->subsector->sector->floorheight;
+                    mo->floorz = mo->z;
+                    mo->ceilingz = mo->subsector->sector->ceilingheight;
+                }
             }
             memset(&prev, 0, sizeof(prev));
             event_count = 0;

@@ -46,6 +46,10 @@ typedef struct {
 boolean API_RouteMap(api_map_t *out);
 boolean API_RouteCellOf(fixed_t x, fixed_t y, int *cx, int *cy);
 
+/* A reachable place roughly `units` of walking from the exit, for a curriculum
+ * that starts an episode a stated distance from its goal. */
+boolean API_RouteSpotAt(int units, unsigned int seed, fixed_t *x, fixed_t *y);
+
 /* The nearest place the player has NOT been, and the way to it. False when
  * every reachable place has been walked. */
 boolean API_Frontier(mobj_t *player, api_route_t *out);
