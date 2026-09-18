@@ -476,47 +476,65 @@ static void DescribeSurroundings(cJSON *root)
     cJSON_AddItemToObject(root, "pickups", pickups);
 }
 
-// How far the player could move in a given direction before something stops
-// them, capped at AGENT_PROBE_MAX. Probed with P_CheckPosition rather than
-// reported from geometry, so a closed door, a ledge and a monster all read the
-// same way they would if the move were attempted.
+// How far the player could WALK in a given direction before the level stops
+// them, capped at AGENT_PROBE_MAX.
 //
-// This is what makes navigation expressible to a policy that only reads text:
-// without it "advance" is a coin flip against a wall, and the observation has
-// no other way to say that a corridor exists to the left.
+// This is a geometry question, not an occupancy one. The first version asked
+// P_CheckPosition whether the player could STAND at a series of points along
+// the ray, and that is a stricter test than walking: Doom slides a player
+// along whatever they brush against, so a decorative pillar or a floor lamp
+// standing beside the path made the probe report a wall where a player walks
+// straight past. Measured on E1M1, it reported "0 units ahead" at a spot the
+// player then crossed 83 units of - and the action set, which hides "walk
+// forward" when there is no room, had hidden the only option that was going
+// anywhere.
+//
+// So: trace the ray against LINES only, the way the engine's own sight and
+// shot code does, and stop at the first one that cannot be walked through -
+// one-sided, explicitly blocking, too short to fit in, or a step too high to
+// climb. A closed door stops it, which is correct and is what makes "push the
+// door in front of you" the right option to offer next.
 #define AGENT_PROBE_MAX 320
-#define AGENT_PROBE_STEP 64
+/// The player's own height and the tallest step they can climb, from p_map.c.
+#define AGENT_HEIGHT (56 * FRACUNIT)
+#define AGENT_STEP (24 * FRACUNIT)
+
+static fixed_t probe_frac;
+static fixed_t probe_z;
+
+static boolean PTR_ProbeTraverse(intercept_t *in)
+{
+    line_t *ld = in->d.line;
+
+    if (!(ld->flags & ML_TWOSIDED) || (ld->flags & ML_BLOCKING))
+    {
+        probe_frac = in->frac;
+        return false;
+    }
+    P_LineOpening(ld);
+    if (openrange < AGENT_HEIGHT || openbottom - probe_z > AGENT_STEP)
+    {
+        probe_frac = in->frac;
+        return false;
+    }
+    return true;
+}
 
 static int Clearance(mobj_t *player, int bearing_deg)
 {
     angle_t a = player->angle + degreesToAngle(bearing_deg);
     fixed_t fx = finecosine[a >> ANGLETOFINESHIFT];
     fixed_t fy = finesine[a >> ANGLETOFINESHIFT];
-    fixed_t ox = player->x;
-    fixed_t oy = player->y;
-    fixed_t oz = player->z;
-    int reached = 0;
-    int d;
+    fixed_t tx = player->x + FixedMul(AGENT_PROBE_MAX << FRACBITS, fx);
+    fixed_t ty = player->y + FixedMul(AGENT_PROBE_MAX << FRACBITS, fy);
 
-    for (d = AGENT_PROBE_STEP; d <= AGENT_PROBE_MAX; d += AGENT_PROBE_STEP)
-    {
-        fixed_t tx = ox + FixedMul(d << FRACBITS, fx);
-        fixed_t ty = oy + FixedMul(d << FRACBITS, fy);
+    probe_frac = FRACUNIT;
+    probe_z = player->z;
+    P_PathTraverse(player->x, player->y, tx, ty, PT_ADDLINES, PTR_ProbeTraverse);
 
-        if (!P_CheckPosition(player, tx, ty))
-        {
-            break;
-        }
-        reached = d;
-    }
-
-    // P_CheckPosition leaves the engine's "thing being moved" scratch state
-    // pointing at the probe; restoring the position keeps a probe from being
-    // observable in the game itself.
-    player->x = ox;
-    player->y = oy;
-    player->z = oz;
-    return reached;
+    // Round DOWN to whole units: a reader comparing this against a threshold
+    // should never be told there is room that is not there.
+    return (int)((long long)AGENT_PROBE_MAX * probe_frac / FRACUNIT);
 }
 
 static void DescribeClearance(cJSON *root)
