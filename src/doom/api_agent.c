@@ -338,6 +338,7 @@ static cJSON *DescribeAgentPlayer(void)
     int i;
     int weapon = (int)p->readyweapon;
 
+    cJSON_AddNumberToObject(o, "id", mo != NULL ? mo->id : -1);
     cJSON_AddNumberToObject(o, "health", p->health);
     cJSON_AddNumberToObject(o, "armor", p->armorpoints);
     if (mo != NULL)
@@ -619,6 +620,71 @@ static void DescribeExit(cJSON *root)
         cJSON_AddStringToObject(o, "kind",
                                 (best->special == 11 || best->special == 51)
                                     ? "switch" : "walkover");
+
+        // A place to STAND to use this exit.
+        //
+        // Not the line's midpoint, which is inside the wall the switch is
+        // mounted on. The walkable side is found by stepping off the line
+        // along its own normal and asking which offsets the player could
+        // actually occupy - geometry the engine can answer and a caller
+        // cannot, and without it "put me at the exit" means "put me inside a
+        // wall".
+        //
+        // A SEARCH rather than one offset: a single 48-unit step found nothing
+        // on E1M1, because the space in front of an exit switch is whatever
+        // the level author happened to leave there. Both sides, several
+        // distances, three points along the line, nearest first.
+        {
+            fixed_t dx = best->v2->x - best->v1->x;
+            fixed_t dy = best->v2->y - best->v1->y;
+            fixed_t len = P_AproxDistance(dx, dy);
+            cJSON *spot = cJSON_CreateObject();
+            boolean found = false;
+            static const int offsets[] = { 32, 56, 80, 112, 144, 192 };
+            static const int alongs[] = { 2, 1, 3 };
+            unsigned int oi, ai;
+            int side;
+
+            for (oi = 0; oi < sizeof(offsets) / sizeof(offsets[0]) && !found; oi++)
+            {
+                for (ai = 0; ai < sizeof(alongs) / sizeof(alongs[0]) && !found; ai++)
+                {
+                    fixed_t px = best->v1->x + dx * alongs[ai] / 4;
+                    fixed_t py = best->v1->y + dy * alongs[ai] / 4;
+
+                    for (side = 0; side < 2 && !found && len > 0; side++)
+                    {
+                        fixed_t sign = side == 0 ? FRACUNIT : -FRACUNIT;
+                        fixed_t nx = FixedDiv(FixedMul(dy, sign), len);
+                        fixed_t ny = FixedDiv(FixedMul(-dx, sign), len);
+                        fixed_t sx = px + FixedMul(offsets[oi] * FRACUNIT, nx);
+                        fixed_t sy = py + FixedMul(offsets[oi] * FRACUNIT, ny);
+                        fixed_t ox = player->x;
+                        fixed_t oy = player->y;
+                        fixed_t oz = player->z;
+
+                        if (P_CheckPosition(player, sx, sy))
+                        {
+                            cJSON_AddNumberToObject(spot, "x", API_FixedToFloat(sx));
+                            cJSON_AddNumberToObject(spot, "y", API_FixedToFloat(sy));
+                            found = true;
+                        }
+                        player->x = ox;
+                        player->y = oy;
+                        player->z = oz;
+                    }
+                }
+            }
+            if (found)
+            {
+                cJSON_AddItemToObject(o, "spot", spot);
+            }
+            else
+            {
+                cJSON_Delete(spot);
+            }
+        }
+
         cJSON_AddItemToObject(root, "exit", o);
     }
 }

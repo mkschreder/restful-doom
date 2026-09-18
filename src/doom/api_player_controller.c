@@ -178,6 +178,17 @@ api_response_t API_PostPlayerAction(cJSON *req)
     }
     else if (strcmp(type, "use") == 0) 
     {
+        // Resolved immediately, which means it uses whatever the player is
+        // facing WHEN THE REQUEST ARRIVES - before any turn in the same
+        // request has been applied. A caller that wants to face something and
+        // press it therefore needs two steps, and the action set here does
+        // exactly that: the turn lands in one decision and the press in the
+        // next, by which time the bearing has closed.
+        //
+        // Posting key_use instead was tried and does not work: P_PlayerThink
+        // latches BT_USE, so a held key fires once and then goes dead until
+        // released, and a one-tic tap posted this way never reached BT_USE at
+        // all.
         P_UseLines(&players[consoleplayer]);
     }
     else if (strcmp(type, "shoot") == 0)
