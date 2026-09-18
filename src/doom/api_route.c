@@ -427,11 +427,28 @@ static void build_edges(mobj_t *probe)
             {
                 continue;
             }
-            /* One of the two ways round the corner, open the whole way. */
+            /* Either one of the two ways round the corner is open the whole
+             * way, or the corner point itself is floor a body fits on.
+             *
+             * The L-path test alone refuses a corridor that RUNS diagonally:
+             * such a corridor has one of its two legs in a wall at every step
+             * along it, so neither way round is ever open, and on E1M2 two
+             * such steps were the only thing joining the level's two halves.
+             *
+             * The corner point alone is what let E1M1's route cut south-west
+             * across a corner whose southward step is a wall. It does not,
+             * once it means what it says: at a corner where two walls meet, a
+             * 32-unit body centred on that point overlaps both of them, and
+             * `walkable` says so. In a diagonal corridor wide enough to walk,
+             * the same point is open floor. Deliberately not `body_fits` here
+             * - its sideways search would find the open floor to one side of
+             * the wall corner and call that passable. */
             if (!((edges[k] & (1 << across))
                   && (edges[ay * grid_w + nx] & (1 << along)))
                 && !((edges[k] & (1 << along))
-                     && (edges[ny * grid_w + ax] & (1 << across))))
+                     && (edges[ny * grid_w + ax] & (1 << across)))
+                && !walkable(probe, (cell_x(ax) + cell_x(nx)) / 2,
+                                    (cell_y(ay) + cell_y(ny)) / 2))
             {
                 continue;
             }
@@ -641,6 +658,122 @@ static void report_frontier(mobj_t *probe)
            by_wall, by_body, by_corner);
 }
 
+/* Can the two sides be joined by walking over cells a player FITS in, if the
+ * step tests are set aside?
+ *
+ * If yes, the separation is this file's crossing tests and the place they gave
+ * up is worth printing. If no, the cells in between are ones a player cannot
+ * stand in at all, and the answer is in the level - a floor that has not been
+ * lowered yet, a lift still up. Those are the two possibilities and nothing
+ * else, so this narrows it in one pass. */
+static void report_fit_path(int *queue)
+{
+    int *from = malloc(sizeof(int) * grid_w * grid_h);
+    int head = 0, tail = 0, k, hit = -1;
+
+    if (from == NULL)
+    {
+        return;
+    }
+    for (k = 0; k < grid_w * grid_h; k++)
+    {
+        from[k] = -2;
+        if (field[k] != ROUTE_UNREACHED)
+        {
+            from[k] = -1;
+            queue[tail++] = k;
+        }
+    }
+    while (head < tail && hit < 0)
+    {
+        int at = queue[head++];
+        int ax = at % grid_w, ay = at / grid_w, d;
+
+        for (d = 0; d < 8; d++)
+        {
+            int nx = ax + ROUTE_DX[d];
+            int ny = ay + ROUTE_DY[d];
+            int ni;
+
+            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+            {
+                continue;
+            }
+            ni = ny * grid_w + nx;
+            if (from[ni] != -2 || !walk[ni])
+            {
+                continue;
+            }
+            from[ni] = at;
+            if (reachable[ni] != ROUTE_UNREACHED)
+            {
+                hit = ni;
+                break;
+            }
+            queue[tail++] = ni;
+        }
+    }
+    if (hit < 0)
+    {
+        printf("API_Route: and no chain of cells a player FITS in joins them either - so "
+               "what is in between is not standable ground yet, which is the level's "
+               "doing and not this file's\n");
+        free(from);
+        return;
+    }
+    printf("API_Route: but a chain of cells the player FITS in DOES join them, so the "
+           "separation is a crossing test here. It gives up at:\n");
+    {
+        int at = hit, shown = 0, chain = 0, missing = 0;
+
+        while (from[at] >= 0)
+        {
+            chain++;
+            at = from[at];
+        }
+        at = hit;
+        printf("API_Route:   the chain is %d cells long, and the steps it needs that "
+               "are missing are:\n", chain);
+        while (from[at] >= 0 && shown < 4)
+        {
+            int prev = from[at];
+            int ax = at % grid_w, ay = at / grid_w;
+            int px = prev % grid_w, py = prev / grid_w;
+            int d;
+
+            for (d = 0; d < 8; d++)
+            {
+                if (ax + ROUTE_DX[d] == px && ay + ROUTE_DY[d] == py)
+                {
+                    break;
+                }
+            }
+            if (d < 8 && !(edges[at] & (1 << d)))
+            {
+                subsector_t *a = R_PointInSubsector(cell_x(ax), cell_y(ay));
+                subsector_t *b = R_PointInSubsector(cell_x(px), cell_y(py));
+
+                printf("API_Route:   %d,%d (floor %d) -> %d,%d (floor %d): %s\n",
+                       cell_x(ax) >> FRACBITS, cell_y(ay) >> FRACBITS,
+                       a->sector->floorheight >> FRACBITS,
+                       cell_x(px) >> FRACBITS, cell_y(py) >> FRACBITS,
+                       b->sector->floorheight >> FRACBITS,
+                       !can_cross(cell_x(ax), cell_y(ay), cell_x(px), cell_y(py))
+                           ? "a wall in the way" : "no room for a body, or a corner cut");
+                shown++;
+                missing++;
+            }
+            at = prev;
+        }
+        if (missing == 0)
+        {
+            printf("API_Route:   ...but every step along it has one, which should not be "
+                   "possible for two separate components\n");
+        }
+    }
+    free(from);
+}
+
 /* The shortest way from the exit's side of the level to the player's side,
  * ignoring whether a player could walk it, and what stands along it.
  *
@@ -741,6 +874,7 @@ static void report_boundary(mobj_t *probe, int *queue)
     printf("API_Route: the operable lines between the two sides:\n");
     report_joining_lines();
     report_frontier(probe);
+    report_fit_path(queue);
 }
 
 /* Build the field once, with `allow_damage` as it stands. False when there is
