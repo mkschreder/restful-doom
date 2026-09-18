@@ -512,7 +512,17 @@ static boolean PTR_ProbeTraverse(intercept_t *in)
         return false;
     }
     P_LineOpening(ld);
-    if (openrange < AGENT_HEIGHT || openbottom - probe_z > AGENT_STEP)
+    /* Headroom, a step the player could climb, and a drop they would survive
+     * being on the edge of. The last one is what a WINDOW is: you can see
+     * through it, the sill is low enough to climb, and P_TryMove still refuses
+     * because the far floor is more than 24 units down and the player would be
+     * standing over the drop. Without it the probe reports the view rather
+     * than the floor - three hundred and twenty units of open space ahead,
+     * strafing works, forward does nothing, and nothing in the observation
+     * says why. */
+    if (openrange < AGENT_HEIGHT
+        || openbottom - probe_z > AGENT_STEP
+        || openbottom - lowfloor > AGENT_STEP)
     {
         probe_frac = in->frac;
         return false;

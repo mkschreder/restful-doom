@@ -747,8 +747,14 @@ static boolean PTR_WalkTraverse(intercept_t *in)
     /* 56 is the player's height and 24 the tallest step they can climb, both
      * from p_map.c. A shut door has an openrange of zero and is deliberately
      * still refused here: the route may go through it, but the player cannot
-     * walk to a point beyond it until it is open. */
-    if (openrange < 56 * FRACUNIT || openbottom - walk_probe_z > 24 * FRACUNIT)
+     * walk to a point beyond it until it is open.
+     *
+     * The third test is the drop on the far side, and it is what makes a
+     * WINDOW a window rather than a doorway: low enough to climb, open above,
+     * and P_TryMove refuses anyway because the player would be standing over
+     * a fall of more than 24 units. */
+    if (openrange < 56 * FRACUNIT || openbottom - walk_probe_z > 24 * FRACUNIT
+        || openbottom - lowfloor > 24 * FRACUNIT)
     {
         walk_blocked = true;
         walk_block_line = ld;
