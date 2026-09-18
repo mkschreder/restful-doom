@@ -28,4 +28,26 @@ typedef struct {
  * written. */
 int API_ExitSpots(mobj_t *probe, api_point_t *out, int max);
 
+/* Where the player has been this episode, for the frontier search. */
+void API_RouteMarkVisited(mobj_t *player);
+void API_RouteForgetVisited(void);
+
+typedef struct {
+    int w;
+    int h;
+    int cell;
+    fixed_t x0;
+    fixed_t y0;
+    /* w*h bytes: 0 unreachable, 1 reachable, 2 walked. Caller frees. */
+    unsigned char *cells;
+} api_map_t;
+
+/* The explored map, for a viewer. */
+boolean API_RouteMap(api_map_t *out);
+boolean API_RouteCellOf(fixed_t x, fixed_t y, int *cx, int *cy);
+
+/* The nearest place the player has NOT been, and the way to it. False when
+ * every reachable place has been walked. */
+boolean API_Frontier(mobj_t *player, api_route_t *out);
+
 #endif

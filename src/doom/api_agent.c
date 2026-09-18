@@ -718,6 +718,30 @@ static void DescribeExit(cJSON *root)
         }
 
         cJSON_AddItemToObject(root, "exit", o);
+
+    // The nearest place the player has not been, and the way there. This is
+    // what makes a level explorable rather than wandered: the search crosses
+    // ground already walked, so an agent is never trapped on the near side of
+    // a corridor it has crossed with unexplored space beyond it.
+    {
+        api_route_t frontier;
+
+        if (API_Frontier(player, &frontier) && frontier.have_step)
+        {
+            angle_t fa = R_PointToAngle2(player->x, player->y, frontier.x, frontier.y);
+            int frel = angleToDegrees(fa - player->angle);
+            cJSON *f = cJSON_CreateObject();
+
+            if (frel > 180)
+            {
+                frel -= 360;
+            }
+            cJSON_AddNumberToObject(f, "distance", frontier.cells * 32);
+            cJSON_AddNumberToObject(f, "bearing", frel);
+            cJSON_AddNumberToObject(f, "clearance", Clearance(player, frel));
+            cJSON_AddItemToObject(root, "unexplored", f);
+        }
+    }
     }
 }
 
@@ -824,6 +848,45 @@ static char *Base64(const byte *in, int len)
 // the bytes and the expansion is one table lookup on the far side; the
 // palette is the CURRENT one, so the damage and pickup tints a player would
 // see are in the frame a reader gets.
+// The explored map: what the agent knows about where it can go and where it
+// has been. Served separately from the frame because a viewer wants both and
+// a policy wants neither.
+api_response_t API_GetMap(void)
+{
+    api_map_t map;
+    mobj_t *player = players[consoleplayer].mo;
+    cJSON *root;
+    char *encoded;
+    int cx = -1, cy = -1;
+
+    if (!API_RouteMap(&map))
+    {
+        return API_CreateErrorResponse(503, "no map has been built for this level");
+    }
+    encoded = Base64(map.cells, map.w * map.h);
+    free(map.cells);
+    if (encoded == NULL)
+    {
+        return API_CreateErrorResponse(500, "out of memory");
+    }
+    root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "width", map.w);
+    cJSON_AddNumberToObject(root, "height", map.h);
+    cJSON_AddNumberToObject(root, "cell", map.cell);
+    cJSON_AddStringToObject(root, "legend", "0 unreachable, 1 reachable, 2 walked");
+    cJSON_AddStringToObject(root, "cells", encoded);
+    free(encoded);
+    if (player != NULL && API_RouteCellOf(player->x, player->y, &cx, &cy))
+    {
+        cJSON *p = cJSON_CreateObject();
+        cJSON_AddNumberToObject(p, "x", cx);
+        cJSON_AddNumberToObject(p, "y", cy);
+        cJSON_AddNumberToObject(p, "angle", angleToDegrees(player->angle));
+        cJSON_AddItemToObject(root, "player", p);
+    }
+    return (api_response_t) { 200, root };
+}
+
 api_response_t API_GetFrame(void)
 {
     cJSON *root;
@@ -1001,6 +1064,10 @@ api_response_t API_PostStep(cJSON *req)
 void API_Agent_PerTic(void)
 {
     DeriveEvents();
+    if (players[consoleplayer].mo != NULL && gamestate == GS_LEVEL)
+    {
+        API_RouteMarkVisited(players[consoleplayer].mo);
+    }
 
     if (awaiting_level)
     {
@@ -1019,6 +1086,7 @@ void API_Agent_PerTic(void)
             memset(&prev, 0, sizeof(prev));
             event_count = 0;
             events_dropped = 0;
+            API_RouteForgetVisited();
             if (response_owed)
             {
                 response_owed = false;

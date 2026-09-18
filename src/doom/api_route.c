@@ -50,6 +50,13 @@
 #define ROUTE_LOOKAHEAD 4
 
 static unsigned short *field;
+/* Which cells the player can reach at all, and which edges between them a
+ * player can cross. Computed once with the distance field and reused, so the
+ * per-observation searches below are array work and no engine queries. */
+static unsigned short *reachable;
+static unsigned char *edges;
+/* Where the player has been this episode. */
+static unsigned char *visited;
 static int grid_w, grid_h;
 static fixed_t grid_x0, grid_y0;
 static void *built_for;
@@ -358,7 +365,10 @@ static void ensure_built(mobj_t *probe)
             break;
         }
     }
-    free(reach);
+    /* Kept: the frontier search walks this component every observation. */
+    free(reachable);
+    reachable = reach;
+    reach = NULL;
     if (seed < 0)
     {
         printf("API_Route: none of the %d standing spots at the exit is reachable\n", n_spots);
@@ -366,6 +376,42 @@ static void ensure_built(mobj_t *probe)
         free(field);
         field = NULL;
         return;
+    }
+    free(edges);
+    edges = calloc(1, grid_w * grid_h);
+    free(visited);
+    visited = calloc(1, grid_w * grid_h);
+    if (edges != NULL)
+    {
+        int k, d;
+        static const int dx[4] = { 1, -1, 0, 0 };
+        static const int dy[4] = { 0, 0, 1, -1 };
+
+        for (k = 0; k < grid_w * grid_h; k++)
+        {
+            if (reachable[k] == ROUTE_UNREACHED)
+            {
+                continue;
+            }
+            for (d = 0; d < 4; d++)
+            {
+                int nx = k % grid_w + dx[d];
+                int ny = k / grid_w + dy[d];
+
+                if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+                {
+                    continue;
+                }
+                if (reachable[ny * grid_w + nx] == ROUTE_UNREACHED)
+                {
+                    continue;
+                }
+                if (can_cross(cell_x(k % grid_w), cell_y(k / grid_w), cell_x(nx), cell_y(ny)))
+                {
+                    edges[k] |= 1 << d;
+                }
+            }
+        }
     }
     printf("API_Route: %dx%d cells at %d units, %d reachable, exit %d cells from the spawn\n",
            grid_w, grid_h, ROUTE_CELL, flood(probe, field, seed, queue),
@@ -450,4 +496,173 @@ boolean API_Route(mobj_t *player, api_route_t *out)
     out->x = cell_x(bx);
     out->y = cell_y(by);
     return true;
+}
+
+void API_RouteForgetVisited(void)
+{
+    if (visited != NULL)
+    {
+        memset(visited, 0, grid_w * grid_h);
+    }
+}
+
+void API_RouteMarkVisited(mobj_t *player)
+{
+    int cx, cy;
+
+    if (visited == NULL || player == NULL || !cell_of(player->x, player->y, &cx, &cy))
+    {
+        return;
+    }
+    visited[cy * grid_w + cx] = 1;
+}
+
+/* The nearest place the player has not been, and the way to it.
+ *
+ * A breadth-first search from the player ACROSS ground already walked. That
+ * crossing is the whole point: the naive alternative - penalise revisiting -
+ * traps an agent on the near side of a strip it has already crossed, with
+ * unexplored space beyond it. Here already-walked ground costs the same as
+ * any other, and only the DESTINATION has to be new.
+ */
+boolean API_Frontier(mobj_t *player, api_route_t *out)
+{
+    int cx, cy, head = 0, tail = 0, found = -1;
+    int *queue;
+    int *parent;
+    int i;
+
+    if (player == NULL || reachable == NULL || edges == NULL || visited == NULL)
+    {
+        return false;
+    }
+    if (!cell_of(player->x, player->y, &cx, &cy)
+        || reachable[cy * grid_w + cx] == ROUTE_UNREACHED)
+    {
+        return false;
+    }
+    queue = malloc(sizeof(int) * grid_w * grid_h);
+    parent = malloc(sizeof(int) * grid_w * grid_h);
+    if (queue == NULL || parent == NULL)
+    {
+        free(queue);
+        free(parent);
+        return false;
+    }
+    for (i = 0; i < grid_w * grid_h; i++)
+    {
+        parent[i] = -2;
+    }
+    parent[cy * grid_w + cx] = -1;
+    queue[tail++] = cy * grid_w + cx;
+
+    while (head < tail && found < 0)
+    {
+        int at = queue[head++];
+        static const int dx[4] = { 1, -1, 0, 0 };
+        static const int dy[4] = { 0, 0, 1, -1 };
+        int d;
+
+        for (d = 0; d < 4; d++)
+        {
+            int nx, ny, ni;
+
+            if (!(edges[at] & (1 << d)))
+            {
+                continue;
+            }
+            nx = at % grid_w + dx[d];
+            ny = at / grid_w + dy[d];
+            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+            {
+                continue;
+            }
+            ni = ny * grid_w + nx;
+            if (parent[ni] != -2)
+            {
+                continue;
+            }
+            parent[ni] = at;
+            if (!visited[ni])
+            {
+                found = ni;
+                break;
+            }
+            queue[tail++] = ni;
+        }
+    }
+
+    if (found < 0)
+    {
+        free(queue);
+        free(parent);
+        return false;
+    }
+
+    /* Path length, and a waypoint a few steps along it rather than the far
+     * end - aiming at the frontier itself would cut corners through walls. */
+    {
+        int steps = 0;
+        int at = found;
+        int path[4096];
+        int n = 0;
+
+        while (at >= 0 && n < 4096)
+        {
+            path[n++] = at;
+            at = parent[at];
+        }
+        out->cells = n - 1;
+        steps = n - 1 - ROUTE_LOOKAHEAD;
+        if (steps < 0)
+        {
+            steps = 0;
+        }
+        out->have_step = true;
+        out->x = cell_x(path[steps] % grid_w);
+        out->y = cell_y(path[steps] / grid_w);
+    }
+    free(queue);
+    free(parent);
+    return true;
+}
+
+/* The explored map, one byte a cell, for a viewer to draw.
+ *
+ * 0 nowhere the player can be, 1 reachable and not yet walked, 2 walked.
+ * Exactly what the frontier search reads, so what a viewer shows and what the
+ * agent decides on cannot drift apart.
+ */
+boolean API_RouteMap(api_map_t *out)
+{
+    int i;
+
+    if (reachable == NULL || visited == NULL)
+    {
+        return false;
+    }
+    out->w = grid_w;
+    out->h = grid_h;
+    out->cell = ROUTE_CELL;
+    out->x0 = grid_x0;
+    out->y0 = grid_y0;
+    out->cells = malloc(grid_w * grid_h);
+    if (out->cells == NULL)
+    {
+        return false;
+    }
+    for (i = 0; i < grid_w * grid_h; i++)
+    {
+        out->cells[i] = reachable[i] == ROUTE_UNREACHED ? 0 : (visited[i] ? 2 : 1);
+    }
+    return true;
+}
+
+boolean API_RouteCellOf(fixed_t x, fixed_t y, int *cx, int *cy)
+{
+    if (reachable == NULL)
+    {
+        return false;
+    }
+    return cell_of(x, y, cx, cy) ? true : false;
 }

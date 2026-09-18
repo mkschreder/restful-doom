@@ -28,5 +28,6 @@ api_response_t API_GetState(void);
 api_response_t API_PostStep(cJSON *req);
 api_response_t API_PostEpisode(cJSON *req);
 api_response_t API_GetFrame(void);
+api_response_t API_GetMap(void);
 
 #endif
