@@ -1,13 +1,12 @@
 #include "api_object_controller.h"
 
 #include "d_player.h"
+#include "doomstat.h"
 #include "p_local.h"
 
 extern api_obj_description_t api_descriptors[];
-extern int consoleplayer;
 
 // externally-defined game variables
-extern player_t         players[MAXPLAYERS];
 extern void             P_KillMobj( mobj_t* source, mobj_t* target );
 
 angle_t degreesToAngle(int degrees) {
@@ -67,7 +66,25 @@ api_response_t API_PostObject(cJSON *req)
         return API_CreateErrorResponse(403, "Clients may not spawn objects");
 
     pobj = players[consoleplayer].mo;
-    angle = pobj->angle >> ANGLETOFINESHIFT;
+
+    // `bearing` turns the spawn point around the player: degrees clockwise
+    // from where they are facing, the same frame the observation reports
+    // things in. Without it `distance` can only put something directly in
+    // front, so a caller building a scenario - several monsters around the
+    // player, the way ViZDoom's do - had to move the player between spawns.
+    //
+    // Distinct from `angle` below, which is the spawned object's OWN facing.
+    angle = pobj->angle;
+    val = cJSON_GetObjectItem(req, "bearing");
+    if (val)
+    {
+        if (!cJSON_IsNumber(val))
+        {
+            return API_CreateErrorResponse(400, "bearing must be a number");
+        }
+        angle += degreesToAngle(val->valueint);
+    }
+    angle >>= ANGLETOFINESHIFT;
 
     val = cJSON_GetObjectItem(req, "distance");
     if (val)
@@ -75,7 +92,11 @@ api_response_t API_PostObject(cJSON *req)
         dist = API_FloatToFixed(val->valueint);
         x = pobj->x + FixedMul(dist, finecosine[angle]);
         y = pobj->y + FixedMul(dist, finesine[angle]);
-        z = ONCEILINGZ;
+        // ON THE FLOOR, not the ceiling. A monster spawned at the ceiling
+        // falls to the floor before it can act, and an item spawned there is
+        // not on the floor to be walked over; both are what a caller asking
+        // for something "250 units ahead" means.
+        z = ONFLOORZ;
     }
     else
     {
@@ -96,6 +117,19 @@ api_response_t API_PostObject(cJSON *req)
     }
 
     mobj = P_SpawnMobj(x, y, z, typeNbr);
+
+    // A monster spawned after the level loaded is not in the total the level
+    // counted at setup, so without this "killed 3 of 6" stops being true the
+    // moment anything is added - and a consumer scoring progress against that
+    // total is scoring against a number that no longer describes the level.
+    if (mobj->flags & MF_COUNTKILL)
+    {
+        totalkills++;
+    }
+    if (mobj->flags & MF_COUNTITEM)
+    {
+        totalitems++;
+    }
 
     val = cJSON_GetObjectItem(req, "angle");
     if (val) mobj->angle = degreesToAngle(val->valueint);
