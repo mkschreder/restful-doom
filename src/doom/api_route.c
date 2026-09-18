@@ -72,22 +72,108 @@ static int grid_w, grid_h;
 static fixed_t grid_x0, grid_y0;
 static void *built_for;
 static int built_count;
+static int built_keys = -1;
+/* What the field is flooded from. Normally the exit; when the exit is behind a
+ * door the player has no key for, the key itself - the level's own next
+ * objective, which is what a player would head for. */
+static int route_goal_key;
 
 static boolean route_blocked;
 
-/* Blocked only by things a player can never cross: a one-sided wall, or a line
- * the author flagged as blocking. A shut door is two-sided and is not blocked. */
+/* Which keys the player had when this grid was built, and which ones the grid
+ * found itself needing. A locked door is a wall to a player without its key
+ * and an open doorway to one with it, so the two are different maps and the
+ * build is keyed on which of them applies. */
+static int held_keys;
+static int keys_wanted;
 
+/* The colour of key a line demands, or 0. Both the doors a player opens by
+ * walking into them and the ones a switch opens remotely; the numbers are
+ * p_doors.c's own. */
+static int lock_of(line_t *ld)
+{
+    switch (ld->special)
+    {
+        case 26: case 32: case 99:  case 133: return API_KEY_BLUE;
+        case 27: case 34: case 136: case 137: return API_KEY_YELLOW;
+        case 28: case 33: case 134: case 135: return API_KEY_RED;
+        default: return 0;
+    }
+}
+
+/* Blocked only by things a player can never cross: a one-sided wall, a line
+ * the author flagged as blocking, or a door locked against the keys they are
+ * carrying. A shut door they CAN open is two-sided and is not blocked - they
+ * open it - which is why the route runs through doors and the agent is told
+ * about the one in front of it. */
 static boolean PTR_RouteTraverse(intercept_t *in)
 {
     line_t *ld = in->d.line;
+    int lock;
 
     if (ld->backsector == NULL || ld->frontsector == NULL || (ld->flags & ML_BLOCKING))
     {
         route_blocked = true;
         return false;
     }
+    lock = lock_of(ld);
+    if (lock != 0 && !(held_keys & (1 << lock)))
+    {
+        route_blocked = true;
+        keys_wanted |= 1 << lock;
+        return false;
+    }
     return true;
+}
+
+/* The keys a player is carrying, as a mask of API_KEY_*. A card and a skull of
+ * the same colour open the same doors, so they are one thing here. */
+static int keys_of(mobj_t *probe)
+{
+    player_t *p = probe->player;
+    int mask = 0;
+
+    if (p == NULL)
+    {
+        return 0;
+    }
+    if (p->cards[it_bluecard] || p->cards[it_blueskull])     mask |= 1 << API_KEY_BLUE;
+    if (p->cards[it_yellowcard] || p->cards[it_yellowskull]) mask |= 1 << API_KEY_YELLOW;
+    if (p->cards[it_redcard] || p->cards[it_redskull])       mask |= 1 << API_KEY_RED;
+    return mask;
+}
+
+/* Where a key of this colour is lying, if one is. Keys are identified by their
+ * sprite, which is how p_inter.c decides what picking one up gives you. */
+static mobj_t *find_key(int colour)
+{
+    thinker_t *th;
+
+    for (th = thinkercap.next; th != &thinkercap && th != NULL; th = th->next)
+    {
+        mobj_t *mo;
+
+        if (th->function.acp1 != (actionf_p1)P_MobjThinker)
+        {
+            continue;
+        }
+        mo = (mobj_t *)th;
+        switch (mo->sprite)
+        {
+            case SPR_BKEY: case SPR_BSKU:
+                if (colour == API_KEY_BLUE) return mo;
+                break;
+            case SPR_YKEY: case SPR_YSKU:
+                if (colour == API_KEY_YELLOW) return mo;
+                break;
+            case SPR_RKEY: case SPR_RSKU:
+                if (colour == API_KEY_RED) return mo;
+                break;
+            default:
+                break;
+        }
+    }
+    return NULL;
 }
 
 /* P_CheckPosition leaves the engine's "thing being moved" scratch state
@@ -893,6 +979,9 @@ static boolean build_field(mobj_t *probe, boolean *no_seed)
     *no_seed = false;
     free(field);
     field = NULL;
+    held_keys = keys_of(probe);
+    keys_wanted = 0;
+    route_goal_key = 0;
 
     n_spots = API_ExitSpots(probe, spots, API_MAX_EXIT_SPOTS);
     if (numvertexes <= 0 || n_spots == 0)
@@ -1038,6 +1127,36 @@ static boolean build_field(mobj_t *probe, boolean *no_seed)
     free(reachable);
     reachable = reach;
     reach = NULL;
+    /* The exit is unreachable and a locked door is why: head for its key
+     * instead. That is what a player does, and it needs no new machinery -
+     * the same field, flooded from a different place. Picking the key up
+     * changes which doors are walls, the grid is rebuilt on that, and the
+     * route goes back to pointing at the exit on its own. */
+    if (seed < 0 && keys_wanted != 0)
+    {
+        int colour;
+
+        for (colour = API_KEY_BLUE; colour <= API_KEY_RED; colour++)
+        {
+            mobj_t *key;
+            int kx, ky;
+
+            if (!(keys_wanted & (1 << colour)))
+            {
+                continue;
+            }
+            key = find_key(colour);
+            if (key == NULL || !cell_of(key->x, key->y, &kx, &ky)
+                || reachable[ky * grid_w + kx] == ROUTE_UNREACHED)
+            {
+                continue;
+            }
+            seed = ky * grid_w + kx;
+            route_goal_key = colour;
+            break;
+        }
+    }
+
     if (seed < 0)
     {
         int walkable_cells = 0, reached = 0;
@@ -1099,9 +1218,12 @@ static boolean build_field(mobj_t *probe, boolean *no_seed)
         int got = flood(field, seed, queue);
         int at_spawn = field[cy * grid_w + cx];
 
-        printf("API_Route: %dx%d cells at %d units, %d reachable, exit %d cells from the "
+        static const char *colour_name[] = { "", "blue", "yellow", "red" };
+
+        printf("API_Route: %dx%d cells at %d units, %d reachable, %s %d cells from the "
                "spawn%s, %d ms to map the steps between them\n",
                grid_w, grid_h, ROUTE_CELL, got,
+               route_goal_key ? colour_name[route_goal_key] : "exit",
                at_spawn == ROUTE_UNREACHED ? -1 : at_spawn,
                allow_damage ? " (through damaging floor)" : "", build_ms);
     }
@@ -1116,7 +1238,8 @@ static void ensure_built(mobj_t *probe)
 {
     boolean no_seed;
 
-    if (field != NULL && built_for == (void *)lines && built_count == numlines)
+    if (field != NULL && built_for == (void *)lines && built_count == numlines
+        && built_keys == keys_of(probe))
     {
         return;
     }
@@ -1125,6 +1248,10 @@ static void ensure_built(mobj_t *probe)
         /* A new level: try the dry route again. */
         allow_damage = false;
     }
+    /* Picking up a key changes which doors are walls, so it changes the map.
+     * Rebuilding on that is what turns "go and get the blue key" into "now go
+     * to the exit" without anything else having to notice. */
+    built_keys = keys_of(probe);
     built_for = (void *)lines;
     built_count = numlines;
 
@@ -1280,6 +1407,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
         out->have_step = true;
         out->blocked = false;
         out->can_open = false;
+        out->goal_key = route_goal_key;
         out->x = cell_x(best % grid_w);
         out->y = cell_y(best / grid_w);
         return true;
@@ -1289,6 +1417,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
     out->have_step = false;
     out->blocked = false;
     out->can_open = false;
+    out->goal_key = route_goal_key;
     if (field[at] == 0)
     {
         return true;
@@ -1386,18 +1515,79 @@ boolean API_Route(mobj_t *player, api_route_t *out)
                 out->block_x = player->x + FixedMul(tx - player->x, walk_block_frac);
                 out->block_y = player->y + FixedMul(ty - player->y, walk_block_frac);
             }
-            /* Off the middle of their own cell and hugging something: steer
-             * back to that middle, which is at most half a cell away and is a
-             * place the player is known to fit. Only worth saying when it is
-             * far enough to be a direction rather than noise. */
-            if (P_AproxDistance(cell_x(cx) - player->x, cell_y(cy) - player->y)
-                    > 12 * FRACUNIT
-                && can_walk_to(player, cell_x(cx), cell_y(cy)))
+            /* The descent walks one chain of cells and gives up the moment
+             * the next link is not straight ahead. That is too literal: the
+             * player is standing somewhere in a cell rather than on its middle,
+             * so which neighbours they can walk straight at depends on exactly
+             * where they are, and in a corridor that bends the chain's own next
+             * cell is often not one of them. Measured on E1M2, a follower
+             * oscillating across five cells for four hundred decisions with the
+             * route bearing swinging through 180 degrees.
+             *
+             * So look around instead: the nearest cell that is closer to the
+             * goal than this one AND that the player can walk straight at from
+             * where they are actually standing. Their own cell's middle
+             * qualifies and is usually the answer when they are hugging a
+             * wall, which is what this replaces. */
             {
-                out->have_step = true;
-                out->x = cell_x(cx);
-                out->y = cell_y(cy);
-                return true;
+                int best = -1, r;
+                fixed_t best_d = 0;
+
+                for (r = 0; r <= ROUTE_RECOVER; r++)
+                {
+                    int dx, dy;
+
+                    for (dy = -r; dy <= r; dy++)
+                    {
+                        for (dx = -r; dx <= r; dx++)
+                        {
+                            int nx = cx + dx, ny = cy + dy, ni;
+                            fixed_t d2;
+
+                            if (abs(dx) != r && abs(dy) != r)
+                            {
+                                continue;
+                            }
+                            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+                            {
+                                continue;
+                            }
+                            ni = ny * grid_w + nx;
+                            if (field[ni] == ROUTE_UNREACHED || field[ni] >= field[at])
+                            {
+                                continue;
+                            }
+                            d2 = P_AproxDistance(cell_x(nx) - player->x,
+                                                 cell_y(ny) - player->y);
+                            /* Far enough to be a direction rather than noise. */
+                            if (d2 < 12 * FRACUNIT)
+                            {
+                                continue;
+                            }
+                            if (!can_walk_to(player, cell_x(nx), cell_y(ny)))
+                            {
+                                continue;
+                            }
+                            if (best < 0 || field[ni] < field[best]
+                                || (field[ni] == field[best] && d2 < best_d))
+                            {
+                                best = ni;
+                                best_d = d2;
+                            }
+                        }
+                    }
+                    if (best >= 0)
+                    {
+                        break;
+                    }
+                }
+                if (best >= 0)
+                {
+                    out->have_step = true;
+                    out->x = cell_x(best % grid_w);
+                    out->y = cell_y(best / grid_w);
+                    return true;
+                }
             }
             bx = first % grid_w;
             by = first / grid_w;

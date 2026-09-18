@@ -705,7 +705,17 @@ static void DescribeExit(cJSON *root)
 
             if (API_Route(player, &route))
             {
+                static const char *key_colour[] = { "", "blue", "yellow", "red" };
+
                 cJSON_AddNumberToObject(o, "pathDistance", route.cells * 32);
+                // What the route LEADS to. A level whose exit is behind a
+                // locked door gives an agent two jobs, and the route does the
+                // first one for it - but calling a key "the exit" would be a
+                // lie the agent has no way to catch.
+                if (route.goal_key > 0)
+                {
+                    cJSON_AddStringToObject(o, "goal", key_colour[route.goal_key]);
+                }
                 if (route.have_step)
                 {
                     angle_t ra = R_PointToAngle2(player->x, player->y, route.x, route.y);

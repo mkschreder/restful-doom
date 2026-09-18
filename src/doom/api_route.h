@@ -20,11 +20,21 @@ typedef struct {
     boolean can_open;
     fixed_t block_x;
     fixed_t block_y;
+    /* What this route actually leads to. 0 is the exit; otherwise the colour
+     * of the key that the exit is locked behind, which the route heads for
+     * first. Calling a key "the exit" in the observation would be a lie the
+     * agent has no way to catch. */
+    int goal_key;
 } api_route_t;
 
 /* Where to go next to make progress toward the exit. False when the level has
  * no exit, or none reachable from where the player is standing. */
 boolean API_Route(mobj_t *player, api_route_t *out);
+
+/* Key colours. A card and a skull of the same colour open the same doors. */
+#define API_KEY_BLUE   1
+#define API_KEY_YELLOW 2
+#define API_KEY_RED    3
 
 #define API_MAX_EXIT_SPOTS 32
 
