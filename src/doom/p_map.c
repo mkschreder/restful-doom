@@ -398,6 +398,66 @@ boolean PIT_CheckThing (mobj_t* thing)
 //  speciallines[]
 //  numspeciallines
 //
+// Whether the LEVEL's geometry allows a thing to stand at a point, ignoring
+// whatever happens to be standing there.
+//
+// P_CheckPosition answers "can this thing be here now", which is the right
+// question for a move and the wrong one for a map. A map of where a player can
+// walk is a property of the level, and things move: an imp asleep in a doorway
+// when the level loads is not a wall, but a position check run once at level
+// load records it as one for good. On E1M3, whose 74 monsters include several
+// standing in doorways, that cut the walkable map into pieces and left the
+// level's own exit unreachable from its own spawn - with -nomonsters the same
+// code found it 76 cells away.
+//
+// Everything else is P_CheckPosition's, including the tmfloorz/tmceilingz/
+// tmdropoffz it leaves behind, so a caller can still apply P_TryMove's height
+// rules afterwards.
+boolean
+P_CheckPositionLines
+( mobj_t*	thing,
+  fixed_t	x,
+  fixed_t	y )
+{
+    int			bx, by, xl, xh, yl, yh;
+    subsector_t*	newsubsec;
+
+    tmthing = thing;
+    tmflags = thing->flags;
+
+    tmx = x;
+    tmy = y;
+
+    tmbbox[BOXTOP] = y + tmthing->radius;
+    tmbbox[BOXBOTTOM] = y - tmthing->radius;
+    tmbbox[BOXRIGHT] = x + tmthing->radius;
+    tmbbox[BOXLEFT] = x - tmthing->radius;
+
+    newsubsec = R_PointInSubsector (x,y);
+    ceilingline = NULL;
+
+    tmfloorz = tmdropoffz = newsubsec->sector->floorheight;
+    tmceilingz = newsubsec->sector->ceilingheight;
+
+    validcount++;
+    numspechit = 0;
+
+    if ( tmflags & MF_NOCLIP )
+	return true;
+
+    xl = (tmbbox[BOXLEFT] - bmaporgx)>>MAPBLOCKSHIFT;
+    xh = (tmbbox[BOXRIGHT] - bmaporgx)>>MAPBLOCKSHIFT;
+    yl = (tmbbox[BOXBOTTOM] - bmaporgy)>>MAPBLOCKSHIFT;
+    yh = (tmbbox[BOXTOP] - bmaporgy)>>MAPBLOCKSHIFT;
+
+    for (bx=xl ; bx<=xh ; bx++)
+	for (by=yl ; by<=yh ; by++)
+	    if (!P_BlockLinesIterator (bx,by,PIT_CheckLine))
+		return false;
+
+    return true;
+}
+
 boolean
 P_CheckPosition
 ( mobj_t*	thing,

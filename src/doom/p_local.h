@@ -227,6 +227,8 @@ extern	line_t*	spechit[MAXSPECIALCROSS];
 extern	int	numspechit;
 
 boolean P_CheckPosition (mobj_t *thing, fixed_t x, fixed_t y);
+// The same, ignoring things: the level's geometry, not who is standing in it.
+boolean P_CheckPositionLines (mobj_t *thing, fixed_t x, fixed_t y);
 boolean P_TryMove (mobj_t* thing, fixed_t x, fixed_t y);
 boolean P_TeleportMove (mobj_t* thing, fixed_t x, fixed_t y);
 void	P_SlideMove (mobj_t* mo);

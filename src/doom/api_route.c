@@ -110,10 +110,19 @@ static boolean hurts(int special)
         || special == 11;
 }
 
+/* Where the LEVEL lets a player stand - not where one could stand right now.
+ *
+ * Things are deliberately ignored. The grid is built once, and a monster
+ * asleep in a doorway when the level loads is not a wall; recording it as one
+ * cuts the map into pieces for the rest of the episode, long after the monster
+ * has wandered off or died. E1M3 has 74 of them and its exit came out
+ * unreachable from its own spawn; with -nomonsters the same code found it 76
+ * cells away. What is standing in the way NOW is a question for the
+ * observation, which answers it every step. */
 static boolean walkable(mobj_t *probe, fixed_t x, fixed_t y)
 {
     fixed_t ox = probe->x, oy = probe->y, oz = probe->z;
-    boolean ok = P_CheckPosition(probe, x, y);
+    boolean ok = P_CheckPositionLines(probe, x, y);
 
     probe->x = ox;
     probe->y = oy;
@@ -444,6 +453,296 @@ static void build_edges(mobj_t *probe)
     }
 }
 
+/* What the lines crossed between two cells are FOR.
+ *
+ * Enough of DOOM's line-special table to name the things that separate one
+ * part of a level from another. A locked door and a lift are both "shut" to a
+ * distance field over geometry, and they need completely different answers
+ * from an agent, so a diagnostic that lumps them together is no use. */
+static const char *special_name(int special)
+{
+    switch (special)
+    {
+        case 0:   return NULL;
+        case 26: case 32: case 99: case 133:  return "BLUE-KEY door";
+        case 28: case 33: case 134: case 135: return "RED-KEY door";
+        case 27: case 34: case 136: case 137: return "YELLOW-KEY door";
+        case 1: case 31: case 117: case 118:  return "door";
+        case 29: case 50: case 103: case 111: case 112: case 113:
+        case 42: case 61: case 63: case 114: case 115: case 116:
+            return "door on a switch or a trigger";
+        case 62: case 88: case 120: case 121: case 122: case 123:
+            return "lift";
+        case 10: case 21: case 87: case 53:
+            return "lift on a trigger";
+        case 39: case 97: case 125: case 126:
+            return "teleporter";
+        default: return "some other special";
+    }
+}
+
+static int boundary_specials[8];
+static int boundary_count;
+
+static boolean PTR_BoundaryTraverse(intercept_t *in)
+{
+    line_t *ld = in->d.line;
+    int i;
+
+    if (ld->special == 0)
+    {
+        return true;
+    }
+    for (i = 0; i < boundary_count; i++)
+    {
+        if (boundary_specials[i] == ld->special)
+        {
+            return true;
+        }
+    }
+    if (boundary_count < 8)
+    {
+        boundary_specials[boundary_count++] = ld->special;
+    }
+    return true;
+}
+
+/* Which of the level's own doors, lifts and switch-operated floors have the
+ * player on one side and the exit on the other.
+ *
+ * This is the question that matters and it is not the same as "what is in the
+ * shortest gap": the shortest gap between two components is usually a thin
+ * wall the level never intended anyone to cross. Every line the author gave a
+ * special to is a thing the player can OPERATE, so a special with the two
+ * components either side of it is the way through, by construction. */
+static void report_joining_lines(void)
+{
+    int i, found = 0;
+
+    for (i = 0; i < numlines; i++)
+    {
+        line_t *ld = &lines[i];
+        fixed_t mx, my, dx, dy, len;
+        int cx, cy, sides[2] = { 0, 0 }, j;
+
+        if (ld->special == 0 || ld->backsector == NULL || ld->frontsector == NULL)
+        {
+            continue;
+        }
+        mx = (ld->v1->x + ld->v2->x) / 2;
+        my = (ld->v1->y + ld->v2->y) / 2;
+        dx = ld->v2->x - ld->v1->x;
+        dy = ld->v2->y - ld->v1->y;
+        len = P_AproxDistance(dx, dy);
+        if (len == 0)
+        {
+            continue;
+        }
+        /* A point a player's width off each face of the line. */
+        dx = FixedDiv(dx, len);
+        dy = FixedDiv(dy, len);
+        for (j = 0; j < 2; j++)
+        {
+            int step;
+
+            /* Walk out from the line until a cell belongs to something. The
+             * first sample often lands inside the door's own sector, which is
+             * a component of its own and answers nothing. */
+            for (step = 40; step <= 160 && sides[j] == 0; step += 24)
+            {
+                fixed_t off = (j == 0 ? step : -step) * FRACUNIT;
+                fixed_t px = mx - FixedMul(dy, off);
+                fixed_t py = my + FixedMul(dx, off);
+
+                if (!cell_of(px, py, &cx, &cy))
+                {
+                    continue;
+                }
+                if (reachable[cy * grid_w + cx] != ROUTE_UNREACHED)
+                {
+                    sides[j] = 1;
+                }
+                else if (field[cy * grid_w + cx] != ROUTE_UNREACHED)
+                {
+                    sides[j] = 2;
+                }
+            }
+        }
+        if ((sides[0] == 1 && sides[1] == 2) || (sides[0] == 2 && sides[1] == 1))
+        {
+            const char *name = special_name(ld->special);
+
+            printf("API_Route:   line %d at %d,%d - special %d, %s - has the player on one "
+                   "side and the exit on the other\n", i, mx >> FRACBITS, my >> FRACBITS,
+                   ld->special, name ? name : "nothing");
+            found++;
+        }
+    }
+    if (found == 0)
+    {
+        printf("API_Route:   no door, lift or switch in the level has the two sides either "
+               "side of it\n");
+    }
+}
+
+/* Why the player's own component stops where it does.
+ *
+ * Every cell the player can reach that has a walkable neighbour it cannot step
+ * to, grouped by which test refused the step. A level coming out in pieces is
+ * either the level's doing - a locked door, a lift - or this file's, and these
+ * counts are the difference. */
+static void report_frontier(mobj_t *probe)
+{
+    int k, d;
+    int by_wall = 0, by_body = 0, by_corner = 0;
+
+    for (k = 0; k < grid_w * grid_h; k++)
+    {
+        int ax = k % grid_w, ay = k / grid_w;
+
+        if (reachable[k] == ROUTE_UNREACHED)
+        {
+            continue;
+        }
+        for (d = 0; d < 8; d++)
+        {
+            int nx = ax + ROUTE_DX[d];
+            int ny = ay + ROUTE_DY[d];
+            int ni;
+
+            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+            {
+                continue;
+            }
+            ni = ny * grid_w + nx;
+            /* Only steps to somewhere the player fits and has not reached. */
+            if (!walk[ni] || reachable[ni] != ROUTE_UNREACHED || (edges[k] & (1 << d)))
+            {
+                continue;
+            }
+            if (d >= 4 && (!(edges[k] & (1 << (ROUTE_DX[d] > 0 ? 0 : 1)))
+                           || !(edges[k] & (1 << (ROUTE_DY[d] > 0 ? 2 : 3)))))
+            {
+                by_corner++;
+            }
+            else if (!can_cross(cell_x(ax), cell_y(ay), cell_x(nx), cell_y(ny)))
+            {
+                by_wall++;
+            }
+            else if (!body_fits(probe, (cell_x(ax) + cell_x(nx)) / 2,
+                                       (cell_y(ay) + cell_y(ny)) / 2, d))
+            {
+                by_body++;
+            }
+        }
+    }
+    printf("API_Route: at the edge of what the player can reach, %d steps refused by a "
+           "wall, %d for no room for a body, %d as a corner cut\n",
+           by_wall, by_body, by_corner);
+}
+
+/* The shortest way from the exit's side of the level to the player's side,
+ * ignoring whether a player could walk it, and what stands along it.
+ *
+ * The two components usually do not touch: whatever separates them is itself
+ * several cells thick, so asking only about cells that are neighbours finds
+ * nothing. This crosses the gap regardless and then reports the line specials
+ * on the way, which is the thing worth knowing - a locked door, a lift and a
+ * floor a switch raises are all "shut" to a distance field over geometry, and
+ * they need completely different answers from an agent.
+ */
+static void report_boundary(mobj_t *probe, int *queue)
+{
+    int *from = malloc(sizeof(int) * grid_w * grid_h);
+    int head = 0, tail = 0, k, hit = -1;
+
+    if (from == NULL)
+    {
+        return;
+    }
+    for (k = 0; k < grid_w * grid_h; k++)
+    {
+        from[k] = -2;
+        if (field[k] != ROUTE_UNREACHED)
+        {
+            from[k] = -1;
+            queue[tail++] = k;
+        }
+    }
+    while (head < tail && hit < 0)
+    {
+        int at = queue[head++];
+        int ax = at % grid_w, ay = at / grid_w, d;
+
+        for (d = 0; d < 4; d++)
+        {
+            int nx = ax + ROUTE_DX[d];
+            int ny = ay + ROUTE_DY[d];
+            int ni;
+
+            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+            {
+                continue;
+            }
+            ni = ny * grid_w + nx;
+            if (from[ni] != -2)
+            {
+                continue;
+            }
+            from[ni] = at;
+            if (reachable[ni] != ROUTE_UNREACHED)
+            {
+                hit = ni;
+                break;
+            }
+            queue[tail++] = ni;
+        }
+    }
+    if (hit < 0)
+    {
+        printf("API_Route: nothing connects the two sides at all, not even through walls\n");
+        free(from);
+        return;
+    }
+
+    boundary_count = 0;
+    {
+        int at = hit, steps = 0;
+
+        while (from[at] >= 0)
+        {
+            int prev = from[at];
+
+            P_PathTraverse(cell_x(at % grid_w), cell_y(at / grid_w),
+                           cell_x(prev % grid_w), cell_y(prev / grid_w),
+                           PT_ADDLINES, PTR_BoundaryTraverse);
+            at = prev;
+            steps++;
+        }
+        printf("API_Route: the nearest way across is %d cells (%d units) of ground the "
+               "player cannot walk, from the player's side at %d,%d to the exit's at "
+               "%d,%d, and the lines along it are:\n", steps, steps * ROUTE_CELL,
+               cell_x(hit % grid_w) >> FRACBITS, cell_y(hit / grid_w) >> FRACBITS,
+               cell_x(at % grid_w) >> FRACBITS, cell_y(at / grid_w) >> FRACBITS);
+    }
+    if (boundary_count == 0)
+    {
+        printf("API_Route:   no line special at all - which means this gap is a wall the "
+               "level never meant anyone to cross, not the way through\n");
+    }
+    for (k = 0; k < boundary_count; k++)
+    {
+        const char *name = special_name(boundary_specials[k]);
+
+        printf("API_Route:   line special %d - %s\n", boundary_specials[k],
+               name ? name : "nothing");
+    }
+    free(from);
+    printf("API_Route: the operable lines between the two sides:\n");
+    report_joining_lines();
+    report_frontier(probe);
+}
+
 /* Build the field once, with `allow_damage` as it stands. False when there is
  * no field to be had; *no_seed says the reason was that no standing spot at
  * the exit could be reached, which is the one failure worth retrying. */
@@ -618,12 +917,13 @@ static boolean build_field(mobj_t *probe, boolean *no_seed)
                "the player can reach, of %d walkable%s\n",
                n_spots, reached, walkable_cells,
                allow_damage ? " (damaging floor allowed)" : "");
-        /* How big the exit's OWN island is. A handful of cells means the spot
-         * search put the exit in a sealed pocket and the bug is here. A whole
-         * region means the level really is in two pieces as far as walking is
-         * concerned, and the way across is a teleporter or a wall some switch
-         * lowers - neither of which is geometry, so no distance field over
-         * geometry will ever find it. */
+        /* How big the exit's OWN island is, and what walls it off. A handful
+         * of cells means the spot search put the exit in a sealed pocket and
+         * the bug is here. A whole region means the level is in two pieces as
+         * far as walking is concerned, and the specials on the lines between
+         * them say why - a locked door, a lift, a floor some switch raises.
+         * None of those is geometry, so no distance field over geometry finds
+         * the way across on its own. */
         for (i = 0; i < n_spots; i++)
         {
             int sx, sy;
@@ -632,9 +932,8 @@ static boolean build_field(mobj_t *probe, boolean *no_seed)
             {
                 int got = flood(field, sy * grid_w + sx, queue);
 
-                printf("API_Route: the exit's own side of the level is %d cells; "
-                       "if that is a whole region, the way across is not walkable "
-                       "(a teleporter, or a wall a switch lowers)\n", got);
+                printf("API_Route: the exit's own side of the level is %d cells\n", got);
+                report_boundary(probe, queue);
                 break;
             }
         }
