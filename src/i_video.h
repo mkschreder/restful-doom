@@ -48,6 +48,8 @@ void I_ShutdownGraphics(void);
 
 // Takes full 8 bit values.
 void I_SetPalette (byte* palette);
+// Read back the palette currently in effect: 256 RGB triples, 768 bytes.
+void I_GetPaletteRGB (byte* dest);
 int I_GetPaletteIndex(int r, int g, int b);
 
 void I_UpdateNoBlit (void);

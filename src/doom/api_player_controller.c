@@ -43,9 +43,7 @@ api_response_t API_PostMessage(cJSON *req)
 // e.g. to turn right to a target of 90 degrees {"type": "right", "target_angle": 90}
 api_response_t API_PostTurnDegrees(cJSON *req)
 {
-    cJSON *type_obj;
     cJSON *amount_obj;
-    char *type;
     int degrees;
 
     amount_obj = cJSON_GetObjectItem(req, "target_angle");
@@ -157,6 +155,26 @@ api_response_t API_PostPlayerAction(cJSON *req)
         event.data1 = *weapon_key;
         event.data2 = 0;
         D_PostEvent(&event);
+    }
+    else if (strcmp(type, "turn-to") == 0)
+    {
+        // Face an ABSOLUTE map angle. The servo in turnPlayer() closes the
+        // remaining angle over the following tics, so this is one action that
+        // spans a step rather than a single-tic key press - which is what
+        // makes "face the imp" expressible at all: the turn keys move the view
+        // by a fixed amount per tic and cannot name a direction.
+        cJSON *angle_obj = cJSON_GetObjectItem(req, "angle");
+
+        if (angle_obj == NULL || !cJSON_IsNumber(angle_obj))
+        {
+            return API_CreateErrorResponse(400, "turn-to needs an angle");
+        }
+        if (angle_obj->valueint < 0 || angle_obj->valueint > 359)
+        {
+            return API_CreateErrorResponse(400, "angle must be 0-359");
+        }
+        target_angle = angle_obj->valueint;
+        turnPlayer();
     }
     else if (strcmp(type, "use") == 0) 
     {

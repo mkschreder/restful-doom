@@ -1,0 +1,803 @@
+//
+// Agent-facing API: one observation per request, lockstep tics, episodes.
+// See api_agent.h for why this is separate from the other controllers.
+//
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "api_agent.h"
+#include "api_player_controller.h"
+#include "api_object_controller.h"
+#include "d_player.h"
+#include "doomstat.h"
+#include "g_game.h"
+#include "m_random.h"
+#include "p_local.h"
+#include "r_main.h"
+#include "v_video.h"
+#include "w_wad.h"
+#include "z_zone.h"
+#include "deh_main.h"
+#include "d_main.h"
+#include "../d_event.h"
+#include "../d_loop.h"
+#include "../i_video.h"
+#include "../m_misc.h"
+
+// prndindex is the engine's second random cursor; doomstat.h exports rndindex
+// but not this one, and seeding an episode means moving both.
+extern int prndindex;
+
+// How far the observation looks, in map units. 1024 is about four rooms of
+// E1M1 and is already more than the player can see; beyond it the list is
+// dominated by things behind walls that no decision depends on.
+#define AGENT_SIGHT 1024
+
+// Events are derived per tic and drained by whatever asks for a state next,
+// so this only has to cover one step's worth. A step of 4 tics cannot produce
+// 64 distinct state changes.
+#define AGENT_MAX_EVENTS 64
+
+// Everything within AGENT_SIGHT, gathered before it is sorted. Bounded: a
+// room with more than this many things in it is not a room whose extra
+// contents change a decision, and an unbounded list would put a malloc in the
+// per-step path.
+#define AGENT_MAX_NEAR 96
+
+enum { NEAR_THREAT, NEAR_HAZARD, NEAR_PICKUP };
+
+typedef struct
+{
+    mobj_t *thing;
+    fixed_t dist;
+    int kind;
+} agent_near_t;
+
+typedef struct
+{
+    int tic;
+    const char *type;
+    char detail[40];
+    int amount;
+} agent_event_t;
+
+static agent_event_t events[AGENT_MAX_EVENTS];
+static int event_count;
+static int events_dropped;
+
+// What the previous tic looked like. Events are the DIFFERENCE between two of
+// these rather than hooks in the engine: every reward this environment pays
+// out leaves a trace in the player's own counters, and a diff cannot miss a
+// call site that a hook can.
+typedef struct
+{
+    boolean valid;
+    int health;
+    int armor;
+    int kills;
+    int items;
+    int secrets;
+    int ammo[NUMAMMO];
+    boolean weapons[NUMWEAPONS];
+    boolean cards[NUMCARDS];
+    boolean dead;
+    gamestate_t state;
+} agent_snapshot_t;
+
+static agent_snapshot_t prev;
+
+// Lockstep bookkeeping.
+static boolean lockstep;
+static int tics_remaining;
+static boolean response_owed;
+// An episode restart is deferred by the engine to the next tic, so the reply
+// waits for the level to actually be running.
+static boolean awaiting_level;
+static int pending_seed;
+static boolean have_pending_seed;
+static int episode_start_tic;
+
+// ---------------------------------------------------------------------------
+//  Events
+// ---------------------------------------------------------------------------
+
+static void PushEvent(const char *type, const char *detail, int amount)
+{
+    agent_event_t *e;
+
+    if (event_count >= AGENT_MAX_EVENTS)
+    {
+        events_dropped++;
+        return;
+    }
+    e = &events[event_count++];
+    e->tic = leveltime;
+    e->type = type;
+    e->amount = amount;
+    if (detail != NULL)
+    {
+        M_StringCopy(e->detail, detail, sizeof(e->detail));
+    }
+    else
+    {
+        e->detail[0] = 0;
+    }
+}
+
+static const char *ammo_names[NUMAMMO] = { "bullets", "shells", "cells", "rockets" };
+static const char *weapon_names[NUMWEAPONS] =
+{
+    "fist", "pistol", "shotgun", "chaingun", "rocket launcher",
+    "plasma rifle", "bfg", "chainsaw", "super shotgun"
+};
+static const char *card_names[NUMCARDS] =
+{
+    "blue keycard", "yellow keycard", "red keycard",
+    "blue skull key", "yellow skull key", "red skull key"
+};
+
+static void SampleInto(agent_snapshot_t *s)
+{
+    player_t *p = &players[consoleplayer];
+    int i;
+
+    s->valid = true;
+    s->health = p->health;
+    s->armor = p->armorpoints;
+    s->kills = p->killcount;
+    s->items = p->itemcount;
+    s->secrets = p->secretcount;
+    for (i = 0; i < NUMAMMO; i++)
+    {
+        s->ammo[i] = p->ammo[i];
+    }
+    for (i = 0; i < NUMWEAPONS; i++)
+    {
+        s->weapons[i] = p->weaponowned[i];
+    }
+    for (i = 0; i < NUMCARDS; i++)
+    {
+        s->cards[i] = p->cards[i];
+    }
+    s->dead = p->playerstate == PST_DEAD || p->health <= 0;
+    s->state = gamestate;
+}
+
+static void DeriveEvents(void)
+{
+    agent_snapshot_t now;
+    int i;
+
+    if (players[consoleplayer].mo == NULL)
+    {
+        return;
+    }
+    SampleInto(&now);
+
+    if (!prev.valid)
+    {
+        prev = now;
+        return;
+    }
+
+    if (now.health < prev.health)
+    {
+        PushEvent("hurt", NULL, prev.health - now.health);
+    }
+    else if (now.health > prev.health)
+    {
+        PushEvent("heal", NULL, now.health - prev.health);
+    }
+    if (now.armor > prev.armor)
+    {
+        PushEvent("armor", NULL, now.armor - prev.armor);
+    }
+    if (now.kills > prev.kills)
+    {
+        PushEvent("kill", NULL, now.kills - prev.kills);
+    }
+    if (now.items > prev.items)
+    {
+        PushEvent("item", NULL, now.items - prev.items);
+    }
+    if (now.secrets > prev.secrets)
+    {
+        PushEvent("secret", NULL, now.secrets - prev.secrets);
+    }
+    for (i = 0; i < NUMAMMO; i++)
+    {
+        if (now.ammo[i] > prev.ammo[i])
+        {
+            PushEvent("ammo", ammo_names[i], now.ammo[i] - prev.ammo[i]);
+        }
+    }
+    for (i = 0; i < NUMWEAPONS; i++)
+    {
+        if (now.weapons[i] && !prev.weapons[i])
+        {
+            PushEvent("weapon", weapon_names[i], 1);
+        }
+    }
+    for (i = 0; i < NUMCARDS; i++)
+    {
+        if (now.cards[i] && !prev.cards[i])
+        {
+            PushEvent("key", card_names[i], 1);
+        }
+    }
+    if (now.dead && !prev.dead)
+    {
+        PushEvent("death", NULL, 1);
+    }
+    if (now.state != prev.state && now.state != GS_LEVEL && prev.state == GS_LEVEL)
+    {
+        // Leaving a live level without dying is the exit switch.
+        PushEvent("exit", NULL, 1);
+    }
+
+    prev = now;
+}
+
+static cJSON *DescribeEvents(void)
+{
+    cJSON *arr = cJSON_CreateArray();
+    int i;
+
+    for (i = 0; i < event_count; i++)
+    {
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddNumberToObject(e, "tic", events[i].tic);
+        cJSON_AddStringToObject(e, "type", events[i].type);
+        if (events[i].detail[0])
+        {
+            cJSON_AddStringToObject(e, "what", events[i].detail);
+        }
+        cJSON_AddNumberToObject(e, "amount", events[i].amount);
+        cJSON_AddItemToArray(arr, e);
+    }
+    return arr;
+}
+
+// ---------------------------------------------------------------------------
+//  Observation
+// ---------------------------------------------------------------------------
+
+// Where something is RELATIVE TO THE PLAYER's facing, in degrees, negative to
+// the left. An absolute map angle is the wrong frame for a decision: "the imp
+// is 20 degrees to your right" is actionable and "the imp is at 143 degrees"
+// is not, and converting between them is the kind of arithmetic a policy
+// should not have to learn.
+static int BearingTo(mobj_t *from, mobj_t *to)
+{
+    angle_t a = R_PointToAngle2(from->x, from->y, to->x, to->y);
+    int rel = angleToDegrees(a - from->angle);
+
+    if (rel > 180)
+    {
+        rel -= 360;
+    }
+    return rel;
+}
+
+static const char *TypeName(mobj_t *t)
+{
+    extern api_obj_description_t api_descriptors[];
+    int i;
+
+    for (i = 0; i < NUMDESCRIPTIONS; i++)
+    {
+        if (api_descriptors[i].id == mobjinfo[t->type].doomednum)
+        {
+            return api_descriptors[i].text;
+        }
+    }
+    return "unknown";
+}
+
+static cJSON *DescribeThing(mobj_t *player, mobj_t *t)
+{
+    cJSON *o = cJSON_CreateObject();
+
+    cJSON_AddNumberToObject(o, "id", t->id);
+    cJSON_AddStringToObject(o, "type", TypeName(t));
+    cJSON_AddNumberToObject(o, "distance",
+                            (int)API_FixedToFloat(P_AproxDistance(player->x - t->x,
+                                                                  player->y - t->y)));
+    cJSON_AddNumberToObject(o, "bearing", BearingTo(player, t));
+    return o;
+}
+
+static cJSON *DescribeLevel(void)
+{
+    cJSON *o = cJSON_CreateObject();
+    player_t *p = &players[consoleplayer];
+
+    cJSON_AddNumberToObject(o, "episode", gameepisode);
+    cJSON_AddNumberToObject(o, "map", gamemap);
+    cJSON_AddNumberToObject(o, "skill", (int)gameskill);
+    cJSON_AddNumberToObject(o, "tic", leveltime);
+    cJSON_AddNumberToObject(o, "kills", p->killcount);
+    cJSON_AddNumberToObject(o, "totalKills", totalkills);
+    cJSON_AddNumberToObject(o, "items", p->itemcount);
+    cJSON_AddNumberToObject(o, "totalItems", totalitems);
+    cJSON_AddNumberToObject(o, "secrets", p->secretcount);
+    cJSON_AddNumberToObject(o, "totalSecrets", totalsecret);
+    return o;
+}
+
+static cJSON *DescribeAgentPlayer(void)
+{
+    player_t *p = &players[consoleplayer];
+    mobj_t *mo = p->mo;
+    cJSON *o = cJSON_CreateObject();
+    cJSON *keys;
+    int i;
+    int weapon = (int)p->readyweapon;
+
+    cJSON_AddNumberToObject(o, "health", p->health);
+    cJSON_AddNumberToObject(o, "armor", p->armorpoints);
+    if (mo != NULL)
+    {
+        cJSON_AddNumberToObject(o, "x", (int)API_FixedToFloat(mo->x));
+        cJSON_AddNumberToObject(o, "y", (int)API_FixedToFloat(mo->y));
+        cJSON_AddNumberToObject(o, "angle", angleToDegrees(mo->angle));
+    }
+    if (weapon >= 0 && weapon < NUMWEAPONS)
+    {
+        cJSON_AddStringToObject(o, "weapon", weapon_names[weapon]);
+        cJSON_AddNumberToObject(o, "ammo", weaponinfo[weapon].ammo < NUMAMMO
+                                              ? p->ammo[weaponinfo[weapon].ammo]
+                                              : -1);
+    }
+    keys = cJSON_CreateArray();
+    for (i = 0; i < NUMCARDS; i++)
+    {
+        if (p->cards[i])
+        {
+            cJSON_AddItemToArray(keys, cJSON_CreateString(card_names[i]));
+        }
+    }
+    cJSON_AddItemToObject(o, "keys", keys);
+    return o;
+}
+
+// What is around the player, in three lists that mean different things:
+//
+//   threats  live MONSTERS (MF_COUNTKILL - the same set the level's kill
+//            total counts, so "killed 3 of 4" and this list agree)
+//   hazards  other shootable things, which on E1M1 means exploding barrels:
+//            worth shooting, but not progress and not a danger on their own
+//   pickups  MF_SPECIAL, everything that can be walked over
+//
+// Lumping the first two together is what the first cut did, and it reported a
+// barrel as an enemy standing 384 units away - a policy told to clear the
+// room would have been scored against a target that does not count.
+static void DescribeSurroundings(cJSON *root)
+{
+    cJSON *threats = cJSON_CreateArray();
+    cJSON *hazards = cJSON_CreateArray();
+    cJSON *pickups = cJSON_CreateArray();
+    mobj_t *player = players[consoleplayer].mo;
+    agent_near_t near[AGENT_MAX_NEAR];
+    int n = 0;
+    int i;
+
+    if (player == NULL)
+    {
+        cJSON_AddItemToObject(root, "threats", threats);
+        cJSON_AddItemToObject(root, "hazards", hazards);
+        cJSON_AddItemToObject(root, "pickups", pickups);
+        return;
+    }
+
+    for (i = 0; i < numsectors && n < AGENT_MAX_NEAR; i++)
+    {
+        mobj_t *t = sectors[i].thinglist;
+
+        while (t && n < AGENT_MAX_NEAR)
+        {
+            fixed_t d = P_AproxDistance(player->x - t->x, player->y - t->y);
+            int kind = -1;
+
+            if (t == player || API_FixedToFloat(d) > AGENT_SIGHT)
+            {
+                t = t->snext;
+                continue;
+            }
+            if ((t->flags & MF_SHOOTABLE) && t->health > 0 && !(t->flags & MF_CORPSE))
+            {
+                kind = (t->flags & MF_COUNTKILL) ? NEAR_THREAT : NEAR_HAZARD;
+            }
+            else if (t->flags & MF_SPECIAL)
+            {
+                kind = NEAR_PICKUP;
+            }
+            if (kind >= 0)
+            {
+                near[n].thing = t;
+                near[n].dist = d;
+                near[n].kind = kind;
+                n++;
+            }
+            t = t->snext;
+        }
+    }
+
+    // BY DISTANCE. The sectors are walked in map order, so without this the
+    // "first" threat is an arbitrary one - which is not a cosmetic detail: a
+    // policy offered "shoot the nearest imp" was being pointed at whichever
+    // monster the map file happened to list first, three rooms away and
+    // through a wall. Insertion sort, because n is at most AGENT_MAX_NEAR and
+    // this runs once per observation.
+    for (i = 1; i < n; i++)
+    {
+        agent_near_t key = near[i];
+        int j = i - 1;
+
+        while (j >= 0 && near[j].dist > key.dist)
+        {
+            near[j + 1] = near[j];
+            j--;
+        }
+        near[j + 1] = key;
+    }
+
+    for (i = 0; i < n; i++)
+    {
+        mobj_t *t = near[i].thing;
+        cJSON *o = DescribeThing(player, t);
+
+        switch (near[i].kind)
+        {
+            case NEAR_THREAT:
+                cJSON_AddNumberToObject(o, "health", t->health);
+                cJSON_AddBoolToObject(o, "visible", P_CheckSight(player, t));
+                cJSON_AddBoolToObject(o, "targetingMe", t->target == player);
+                cJSON_AddItemToArray(threats, o);
+                break;
+            case NEAR_HAZARD:
+                cJSON_AddNumberToObject(o, "health", t->health);
+                cJSON_AddBoolToObject(o, "visible", P_CheckSight(player, t));
+                cJSON_AddItemToArray(hazards, o);
+                break;
+            default:
+                cJSON_AddBoolToObject(o, "visible", P_CheckSight(player, t));
+                cJSON_AddItemToArray(pickups, o);
+                break;
+        }
+    }
+
+    cJSON_AddItemToObject(root, "threats", threats);
+    cJSON_AddItemToObject(root, "hazards", hazards);
+    cJSON_AddItemToObject(root, "pickups", pickups);
+}
+
+// Whether the episode is over, and how it went. An episode ends when the
+// player dies or when the level is left - the two things this environment is
+// scored on.
+static const char *Outcome(boolean *done)
+{
+    player_t *p = &players[consoleplayer];
+
+    if (p->playerstate == PST_DEAD || p->health <= 0)
+    {
+        *done = true;
+        return "dead";
+    }
+    if (gamestate != GS_LEVEL)
+    {
+        *done = true;
+        return "exited";
+    }
+    *done = false;
+    return "alive";
+}
+
+static cJSON *BuildState(void)
+{
+    cJSON *root = cJSON_CreateObject();
+    boolean done = false;
+    const char *outcome = Outcome(&done);
+
+    cJSON_AddNumberToObject(root, "tic", gametic);
+    cJSON_AddNumberToObject(root, "episodeTic", gametic - episode_start_tic);
+    cJSON_AddItemToObject(root, "level", DescribeLevel());
+    cJSON_AddItemToObject(root, "player", DescribeAgentPlayer());
+    DescribeSurroundings(root);
+    cJSON_AddItemToObject(root, "events", DescribeEvents());
+    if (events_dropped > 0)
+    {
+        cJSON_AddNumberToObject(root, "eventsDropped", events_dropped);
+    }
+    cJSON_AddBoolToObject(root, "done", done);
+    cJSON_AddStringToObject(root, "outcome", outcome);
+
+    // Drained: an event is reported exactly once, to exactly one reader.
+    event_count = 0;
+    events_dropped = 0;
+    return root;
+}
+
+api_response_t API_GetState(void)
+{
+    return (api_response_t) { 200, BuildState() };
+}
+
+// ---------------------------------------------------------------------------
+//  Frame
+// ---------------------------------------------------------------------------
+
+static const char b64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Returns a malloc'd NUL-terminated string the caller owns.
+static char *Base64(const byte *in, int len)
+{
+    int out_len = ((len + 2) / 3) * 4;
+    char *out = malloc(out_len + 1);
+    int i;
+    int o = 0;
+
+    if (out == NULL)
+    {
+        return NULL;
+    }
+    for (i = 0; i + 2 < len; i += 3)
+    {
+        unsigned int v = (in[i] << 16) | (in[i + 1] << 8) | in[i + 2];
+        out[o++] = b64[(v >> 18) & 63];
+        out[o++] = b64[(v >> 12) & 63];
+        out[o++] = b64[(v >> 6) & 63];
+        out[o++] = b64[v & 63];
+    }
+    if (i < len)
+    {
+        unsigned int v = in[i] << 16;
+        boolean two = i + 1 < len;
+
+        if (two)
+        {
+            v |= in[i + 1] << 8;
+        }
+        out[o++] = b64[(v >> 18) & 63];
+        out[o++] = b64[(v >> 12) & 63];
+        out[o++] = two ? b64[(v >> 6) & 63] : '=';
+        out[o++] = '=';
+    }
+    out[o] = 0;
+    return out;
+}
+
+// The 320x200 8-bit framebuffer the engine just drew, plus the palette it
+// would be shown through. Indexed rather than RGB because it is a fifth of
+// the bytes and the expansion is one table lookup on the far side; the
+// palette is the CURRENT one, so the damage and pickup tints a player would
+// see are in the frame a reader gets.
+api_response_t API_GetFrame(void)
+{
+    cJSON *root;
+    char *pix;
+    char *pal;
+    byte pal_bytes[768];
+    int i;
+
+    if (I_VideoBuffer == NULL)
+    {
+        return API_CreateErrorResponse(503, "no framebuffer yet");
+    }
+
+    I_GetPaletteRGB(pal_bytes);
+
+    pix = Base64(I_VideoBuffer, SCREENWIDTH * SCREENHEIGHT);
+    pal = Base64(pal_bytes, sizeof(pal_bytes));
+    if (pix == NULL || pal == NULL)
+    {
+        free(pix);
+        free(pal);
+        return API_CreateErrorResponse(500, "out of memory");
+    }
+
+    root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "width", SCREENWIDTH);
+    cJSON_AddNumberToObject(root, "height", SCREENHEIGHT);
+    cJSON_AddStringToObject(root, "format", "indexed8");
+    cJSON_AddStringToObject(root, "pixels", pix);
+    cJSON_AddStringToObject(root, "palette", pal);
+    free(pix);
+    free(pal);
+    (void)i;
+    return (api_response_t) { 200, root };
+}
+
+// ---------------------------------------------------------------------------
+//  Episodes and stepping
+// ---------------------------------------------------------------------------
+
+void API_Agent_Init(void)
+{
+    lockstep = M_CheckParm("-apilockstep") > 0;
+    if (lockstep)
+    {
+        // Run one tic per pass of the game loop and never wait on the wall
+        // clock: in lockstep the agent is the clock.
+        singletics = true;
+        printf("API_Agent: lockstep - the game advances only on POST /api/step\n");
+    }
+    memset(&prev, 0, sizeof(prev));
+    episode_start_tic = gametic;
+}
+
+boolean API_Agent_Lockstep(void)
+{
+    return lockstep;
+}
+
+api_response_t API_PostEpisode(cJSON *req)
+{
+    cJSON *val;
+    int episode = gameepisode;
+    int map = gamemap;
+    int skill = (int)gameskill;
+
+    val = cJSON_GetObjectItem(req, "episode");
+    if (val != NULL)
+    {
+        if (!cJSON_IsNumber(val))
+        {
+            return API_CreateErrorResponse(400, "episode must be a number");
+        }
+        episode = val->valueint;
+    }
+    val = cJSON_GetObjectItem(req, "map");
+    if (val != NULL)
+    {
+        if (!cJSON_IsNumber(val))
+        {
+            return API_CreateErrorResponse(400, "map must be a number");
+        }
+        map = val->valueint;
+    }
+    val = cJSON_GetObjectItem(req, "skill");
+    if (val != NULL)
+    {
+        if (!cJSON_IsNumber(val) || val->valueint < 0 || val->valueint > 4)
+        {
+            return API_CreateErrorResponse(400, "skill must be 0-4");
+        }
+        skill = val->valueint;
+    }
+    val = cJSON_GetObjectItem(req, "seed");
+    if (val != NULL)
+    {
+        if (!cJSON_IsNumber(val))
+        {
+            return API_CreateErrorResponse(400, "seed must be a number");
+        }
+        pending_seed = val->valueint;
+        have_pending_seed = true;
+    }
+
+    G_DeferedInitNew((skill_t)skill, episode, map);
+
+    // The engine acts on that at the top of the next tic, and the level is not
+    // there to describe until it has. Hold the reply until it is.
+    awaiting_level = true;
+    tics_remaining = 0;
+    response_owed = true;
+    event_count = 0;
+    events_dropped = 0;
+    memset(&prev, 0, sizeof(prev));
+
+    // Status 0 is this file's signal to the transport that the response is
+    // owed but not ready - see API_Agent_PerTic.
+    return (api_response_t) { 0, NULL };
+}
+
+api_response_t API_PostStep(cJSON *req)
+{
+    cJSON *val;
+    cJSON *actions;
+    int tics = 1;
+
+    if (!lockstep)
+    {
+        return API_CreateErrorResponse(409,
+            "not running in lockstep; restart with -apilockstep");
+    }
+
+    val = cJSON_GetObjectItem(req, "tics");
+    if (val != NULL)
+    {
+        if (!cJSON_IsNumber(val) || val->valueint < 1 || val->valueint > 350)
+        {
+            return API_CreateErrorResponse(400, "tics must be 1-350");
+        }
+        tics = val->valueint;
+    }
+
+    actions = cJSON_GetObjectItem(req, "actions");
+    if (actions != NULL)
+    {
+        cJSON *a;
+
+        if (!cJSON_IsArray(actions))
+        {
+            return API_CreateErrorResponse(400, "actions must be an array");
+        }
+        cJSON_ArrayForEach(a, actions)
+        {
+            // One vocabulary: the step body takes exactly what
+            // POST /api/player/actions takes, by calling it.
+            api_response_t r = API_PostPlayerAction(a);
+
+            if (r.status_code >= 400)
+            {
+                return r;
+            }
+            if (r.json)
+            {
+                cJSON_Delete(r.json);
+            }
+        }
+    }
+
+    tics_remaining = tics;
+    response_owed = true;
+    return (api_response_t) { 0, NULL };
+}
+
+// Once per tic, before the tic runs.
+void API_Agent_PerTic(void)
+{
+    DeriveEvents();
+
+    if (awaiting_level)
+    {
+        if (gamestate == GS_LEVEL && gameaction == ga_nothing)
+        {
+            awaiting_level = false;
+            episode_start_tic = gametic;
+            if (have_pending_seed)
+            {
+                // G_InitNew has already cleared these; move them to where the
+                // caller asked so two episodes with different seeds diverge.
+                rndindex = pending_seed & 0xff;
+                prndindex = (pending_seed >> 8) & 0xff;
+                have_pending_seed = false;
+            }
+            memset(&prev, 0, sizeof(prev));
+            event_count = 0;
+            events_dropped = 0;
+            if (response_owed)
+            {
+                response_owed = false;
+                API_SendResponse((api_response_t) { 200, BuildState() });
+            }
+        }
+    }
+    else if (tics_remaining > 0)
+    {
+        tics_remaining--;
+        if (tics_remaining == 0 && response_owed)
+        {
+            response_owed = false;
+            API_SendResponse((api_response_t) { 200, BuildState() });
+        }
+    }
+
+    if (!lockstep)
+    {
+        return;
+    }
+
+    // Hand the loop to the API: nothing advances until a request asks it to.
+    while (tics_remaining == 0 && !awaiting_level)
+    {
+        if (API_Poll(-1))
+        {
+            API_ServeRequest();
+        }
+    }
+}

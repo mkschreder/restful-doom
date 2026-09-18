@@ -633,6 +633,25 @@ void I_SetPalette (byte *doompalette)
     palette_to_set = true;
 }
 
+// The palette currently in effect, as 256 RGB triples.
+//
+// Not the PLAYPAL lump: what is live here is PLAYPAL through the gamma table
+// and through whatever damage/pickup/radsuit tint the game last applied, so a
+// frame handed to a reader alongside it looks like what a player would see
+// rather than like the level's neutral colours.
+
+void I_GetPaletteRGB(byte *dest)
+{
+    int i;
+
+    for (i = 0; i < 256; ++i)
+    {
+        *dest++ = palette[i].r;
+        *dest++ = palette[i].g;
+        *dest++ = palette[i].b;
+    }
+}
+
 // Given an RGB value, find the closest matching palette index.
 
 int I_GetPaletteIndex(int r, int g, int b)

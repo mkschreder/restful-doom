@@ -34,6 +34,7 @@ cJSON* DescribeMObj(mobj_t *obj);
 void API_SetHUDMessage(char *msg);
 void API_FlipFlag(int *flags, int mask, boolean on);
 void turnPlayer();
+int angleToDegrees(angle_t angle);
 
 typedef struct {
   int id;

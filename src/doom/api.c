@@ -16,6 +16,7 @@
 #include "api_world_controller.h"
 #include "api_door_controller.h"
 #include "api_object_controller.h"
+#include "api_agent.h"
 
 
 extern api_obj_description_t api_descriptors[];
@@ -99,6 +100,8 @@ void API_Init(int port)
 
     host = SDLNet_ResolveIP(&ip);
     printf("API_Init: Listening for connections on %s:%d\n", host, port);
+
+    API_Agent_Init();
 }
 
 // Close the client connection and discard whatever it had buffered.
@@ -383,16 +386,26 @@ void API_ServeRequest(void)
                response.status_code);
     }
 
-    API_SendResponse(response);
+    // Status 0 means the handler owes a response it cannot write yet - a step
+    // is answered with the state AFTER its tics have run, so the reply is sent
+    // from API_Agent_PerTic once they have.
+    if (response.status_code != 0)
+    {
+        API_SendResponse(response);
+    }
 }
 
 void API_RunIO()
 {
-    if (API_Poll(0))
+    // In lockstep the agent owns the clock, and API_Agent_PerTic is what
+    // blocks the loop until it says to advance - serving requests from there
+    // rather than here, so a request cannot be answered mid-step.
+    if (!API_Agent_Lockstep() && API_Poll(0))
     {
         API_ServeRequest();
     }
 
+    API_Agent_PerTic();
     API_AfterTic();
 }
 
@@ -448,7 +461,39 @@ api_response_t API_RouteRequest(api_request_t req)
     char *path = req.url.path;
     cJSON *json = cJSON_Parse(req.body);
     
-    if (strcmp(path, "api/message") == 0)
+    if (strcmp(path, "api/state") == 0)
+    {
+        if (strcmp(method, "GET") == 0)
+        {
+            return API_GetState();
+        }
+        return API_CreateErrorResponse(405, "Method not allowed");
+    }
+    else if (strcmp(path, "api/step") == 0)
+    {
+        if (strcmp(method, "POST") == 0)
+        {
+            return API_PostStep(json);
+        }
+        return API_CreateErrorResponse(405, "Method not allowed");
+    }
+    else if (strcmp(path, "api/episode") == 0)
+    {
+        if (strcmp(method, "POST") == 0)
+        {
+            return API_PostEpisode(json);
+        }
+        return API_CreateErrorResponse(405, "Method not allowed");
+    }
+    else if (strcmp(path, "api/frame") == 0)
+    {
+        if (strcmp(method, "GET") == 0)
+        {
+            return API_GetFrame();
+        }
+        return API_CreateErrorResponse(405, "Method not allowed");
+    }
+    else if (strcmp(path, "api/message") == 0)
     {
         if (strcmp(method, "POST") == 0)
         {
