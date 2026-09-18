@@ -190,17 +190,33 @@ api_response_t API_PatchObject(int id, cJSON *req)
     }
     pos = cJSON_GetObjectItem(req, "position");
     if (pos) {
+        cJSON *zval = cJSON_GetObjectItem(pos, "z");
+
         P_UnsetThingPosition(obj);
         val = cJSON_GetObjectItem(pos, "x");
         if (val) obj->x = API_FloatToFixed(val->valuedouble);
-        
+
         val = cJSON_GetObjectItem(pos, "y");
         if (val) obj->y = API_FloatToFixed(val->valuedouble);
-        
-        val = cJSON_GetObjectItem(pos, "z");
-        if (val) obj->z = API_FloatToFixed(val->valuedouble);
-        
+
+        if (zval) obj->z = API_FloatToFixed(zval->valuedouble);
+
         P_SetThingPosition(obj);
+
+        // A sector's floor is only known once the thing is linked into it, and
+        // it is rarely the floor of the sector the thing came from. Carrying
+        // the old z across leaves the thing buried in the new floor or hanging
+        // above it; buried, every P_TryMove is refused as too big a step up and
+        // the thing cannot move in any direction at all.
+        obj->floorz = obj->subsector->sector->floorheight;
+        obj->ceilingz = obj->subsector->sector->ceilingheight;
+        if (!zval)
+        {
+            obj->z = obj->floorz;
+        }
+        if (obj->z < obj->floorz) obj->z = obj->floorz;
+        if (obj->z + obj->height > obj->ceilingz)
+            obj->z = obj->ceilingz - obj->height;
     }
     val = cJSON_GetObjectItem(req, "angle");
     if (val) obj->angle = degreesToAngle(val->valueint);
