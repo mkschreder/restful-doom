@@ -11,6 +11,112 @@ types:
 
 baseUri: http://localhost:6666
 
+/api/state:
+  description: |
+    The whole observation in ONE request: level progress, the player, what is
+    around them sorted by distance, how far there is to walk in six directions,
+    where the exit is, and the events derived since this was last read.
+
+    Shaped for an agent rather than a person. Every other endpoint here answers
+    one question, which is right for a human with curl and wrong for something
+    deciding once per tic - that would be four round trips per decision, each
+    seeing a slightly different moment.
+  get:
+    responses:
+      200:
+        body:
+          application/json:
+            example: |
+              {
+                "tic": 574, "episodeTic": 120,
+                "level": {"episode": 1, "map": 1, "skill": 3, "tic": 120,
+                          "kills": 2, "totalKills": 29, "items": 1,
+                          "totalItems": 37, "secrets": 0, "totalSecrets": 3},
+                "player": {"health": 86, "armor": 0, "x": 1286, "y": -3512,
+                           "angle": 321, "weapon": "pistol", "ammo": 44,
+                           "keys": []},
+                "threats": [{"id": 80, "type": "FORMER HUMAN SERGEANT",
+                             "distance": 180, "bearing": -12, "visible": true,
+                             "health": 30, "targetingMe": true}],
+                "hazards": [{"id": 26, "type": "Barrel", "distance": 279,
+                             "bearing": 78, "visible": true, "health": 20}],
+                "pickups": [{"id": 31, "type": "Medikit", "distance": 96,
+                             "bearing": 10, "visible": true}],
+                "clearance": {"ahead": 320, "right": 64, "behind": 0,
+                              "left": 128, "aheadRight": 320, "aheadLeft": 64},
+                "exit": {"distance": 2217, "bearing": -53, "kind": "switch",
+                         "clearance": 0},
+                "events": [{"tic": 118, "type": "hurt", "amount": 15}],
+                "done": false, "outcome": "alive"
+              }
+
+/api/step:
+  description: |
+    Apply actions, run exactly N tics, and answer with the state that results.
+
+    Requires -apilockstep, in which the game advances ONLY on this call. That
+    is what makes a rollout reproducible and what decouples training from the
+    35Hz clock - measured, 2966 tics/s against 35.
+
+    `actions` takes exactly what POST /api/player/actions takes.
+  post:
+    body:
+      application/json:
+        example: |
+          {
+            "tics": 4,
+            "actions": [{"type": "turn-to", "angle": 78}, {"type": "shoot"}]
+          }
+    responses:
+      200:
+        description: The same body GET /api/state returns, after the tics ran.
+      400:
+        description: tics outside 1-350, or an invalid action
+      409:
+        description: Not running in lockstep
+
+/api/episode:
+  description: |
+    Restart a level reproducibly. The reply is held until the level is actually
+    running, so the state that comes back describes the new episode rather than
+    the old one being torn down.
+  post:
+    body:
+      application/json:
+        example: |
+          {"episode": 1, "map": 1, "skill": 3, "seed": 7}
+    responses:
+      200:
+        description: |
+          The same body GET /api/state returns, for the newly started level.
+          `seed` moves the engine's random cursors after G_InitNew has cleared
+          them, so two episodes with different seeds diverge.
+      400:
+        description: Invalid episode, map, skill (0-4) or seed
+
+/api/frame:
+  description: |
+    The 320x200 framebuffer the engine just drew, and the palette it would be
+    shown through.
+
+    Indexed rather than RGB because it is a fifth of the bytes and the
+    expansion is one table lookup on the far side. The palette is the CURRENT
+    one, not the PLAYPAL lump, so the damage and pickup tints a player would
+    see are in what a reader gets.
+  get:
+    responses:
+      200:
+        body:
+          application/json:
+            example: |
+              {
+                "width": 320, "height": 200, "format": "indexed8",
+                "pixels": "<base64, width*height bytes>",
+                "palette": "<base64, 768 bytes>"
+              }
+      503:
+        description: Graphics are not up yet
+
 /api/player:
   description: Player endpoints
   get:

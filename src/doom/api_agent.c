@@ -609,6 +609,13 @@ static void DescribeExit(cJSON *root)
         }
         cJSON_AddNumberToObject(o, "distance", (int)API_FixedToFloat(best_dist));
         cJSON_AddNumberToObject(o, "bearing", rel);
+        // How far the player would actually get if they set off toward it.
+        // Without this, "head for the exit" is an option whose feasibility
+        // nothing in the observation reports: the six fixed probes are at
+        // fixed bearings and the exit is wherever it is, so an agent offered
+        // the exit had no way to know it was on the far side of a wall - and
+        // a scripted one spent whole episodes walking into that wall.
+        cJSON_AddNumberToObject(o, "clearance", Clearance(player, rel));
         cJSON_AddStringToObject(o, "kind",
                                 (best->special == 11 || best->special == 51)
                                     ? "switch" : "walkover");

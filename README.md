@@ -17,6 +17,44 @@ RESTFul-DOOM is built on top of the awesome [Chocolate Doom](https://github.com/
 ### More details in blog post:
 http://1amstudios.com/2017/08/01/restful-doom/
 
+## Driving it from an agent
+
+Alongside the human-facing API above there is a surface shaped for something
+that decides once per tic. The difference is not cosmetic - a policy needs the
+whole observation in one round trip, a game that advances only when it says so,
+an episode it can restart reproducibly, and a record of what happened in
+between.
+
+| | |
+|---|---|
+| `GET /api/state` | the whole observation in ONE request: level progress, the player, what is around them sorted by distance, how far there is to WALK in six directions, where the exit is, and the events since this was last read |
+| `POST /api/step` | apply actions, run exactly N tics, answer with the state that results |
+| `POST /api/episode` | restart a level reproducibly, seed included |
+| `GET /api/frame` | the 320x200 framebuffer and the palette in effect |
+
+```
+src/restful-doom -iwad doom1.wad -apiport 6666 -apilockstep -noblit     -warp 1 1 -skill 4 -nosound -nomusic
+```
+
+- **`-apilockstep`** hands the clock to the agent: `singletics`, and the game
+  loop blocks until a step says to advance. Between steps the world is frozen -
+  read `/api/state` twice two seconds apart and the tic is the same.
+- **`-noblit`** keeps the engine RENDERING into its framebuffer (so
+  `/api/frame` still works) while skipping the blit, upscale and present. On
+  E1M1 that is most of the cost of a tic.
+- **`-apiverbose`** turns the per-request access log back on. It is off by
+  default because at one request per tic it is not a log, and writing it was a
+  measurable part of a step.
+
+Measured on E1M1: **~0.14ms per tic and ~0.45ms per request**, so a step of four
+tics costs about 1.3ms against the 114ms of wall clock the same four tics take
+at 35Hz - **85x realtime**.
+
+Events are DERIVED by diffing the player's own counters each tic rather than
+hooked into the engine at a dozen call sites: kills, damage, healing, armour,
+ammo, weapons, keys, secrets, death and the level exit all leave a trace in
+those counters, and a diff cannot miss a call site the way a hook can.
+
 ## API Spec
 
 [API spec in RAML 1.0 format](https://github.com/jeff-1amstudios/restful-doom/blob/master/RAML/doom.raml)
