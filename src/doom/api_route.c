@@ -38,6 +38,7 @@
 #include "doomstat.h"
 #include "p_local.h"
 #include "r_main.h"
+#include "i_timer.h"
 #include "r_state.h"
 
 /* Grid resolution. The player is 32 units wide, so a 64-unit cell is about one
@@ -49,6 +50,9 @@
  * between neighbours as the player crosses a boundary - and too far cuts
  * corners through walls. Four cells is about one decision of walking. */
 #define ROUTE_LOOKAHEAD 4
+/* How far to look for the route when the player is standing off it, in cells.
+ * Six is about two of the player's own decisions of walking. */
+#define ROUTE_RECOVER 6
 
 static unsigned short *field;
 /* Which cells the player can reach at all, and which edges between them a
@@ -279,87 +283,189 @@ static int flood(unsigned short *out, int seed, int *queue)
     return reached;
 }
 
+/* Is there room for a 32-unit body to pass between two cells?
+ *
+ * On the line between the centres, or a little to either side of it. The
+ * sideways search is what makes this a test of the GAP rather than of one
+ * arbitrary point: a doorway 32 units wide is exactly the player's width, and
+ * whether its middle lines up with a cell boundary is an accident of where the
+ * level sits on the grid. Requiring the midpoint itself severed real passages
+ * and left E1M2's exit unreachable from its own spawn.
+ *
+ * Half a cell either side and no further. Sampling a whole cell out finds gaps
+ * the crossing cannot use and the field acquires steps through walls - the
+ * worst symptom there is, a route that looks authoritative and points at a
+ * wall sixteen units ahead. */
+static boolean body_fits(mobj_t *probe, fixed_t x, fixed_t y, int d)
+{
+    /* (-dy, dx): across the direction of travel, which is where the room to
+     * pass has to be. (dy, dx) is not perpendicular to a diagonal - it is the
+     * diagonal again - so that spelling tested the same line twice. */
+    fixed_t px = -ROUTE_DY[d] * FRACUNIT;
+    fixed_t py = ROUTE_DX[d] * FRACUNIT;
+    int off;
+
+    for (off = 0; off <= ROUTE_CELL / 2; off += ROUTE_CELL / 8)
+    {
+        if (walkable(probe, x + px * off, y + py * off)
+            || walkable(probe, x - px * off, y - py * off))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The direction that undoes each of the eight, so a pair of cells is tested
+ * once and the answer written into both. */
+static const int ROUTE_OPPOSITE[8] = { 1, 0, 3, 2, 7, 6, 5, 4 };
+
+/* How many steps survived each test, for the line the build prints. A level
+ * whose rooms come out disconnected shows up here as a suspicious number
+ * rather than as an agent that mysteriously never finds the exit. */
+static int kept_straight, kept_diagonal, dropped_wall, dropped_body;
+
 /* Every step a player can take on this grid, computed once.
  *
- * A cell pair is joined when a sight ray between the centres crosses no solid
- * line AND a 32-unit-wide body fits at the midpoint. The ray alone is what a
- * route used to be built from, and it is not enough: a ray is a point and
- * threads gaps a body wedges in. A diagonal additionally needs both of its
- * orthogonals, or the path squeezes through the corner where two walls meet. */
+ * Straight steps first. Both cells must hold a 32-unit body, a sight line
+ * between the centres must cross no solid line, and a body must fit somewhere
+ * across the gap between them. The sight line alone is not enough: it is a
+ * point, and a point threads gaps a body wedges in.
+ *
+ * Diagonals second, because a diagonal is only allowed where one of the two
+ * L-shaped ways round it is allowed - as STEPS, not merely as cells a player
+ * fits in, which is why they cannot be done in the same pass. Both cells
+ * either side of a corner being roomy says nothing about getting between
+ * them, and on E1M1 that let the route cut across a corner whose southward
+ * step is a wall, with no other way down the field from that cell.
+ *
+ * Either way round and not both: a corridor running diagonally has one of its
+ * two legs in a wall at every step along it. */
 static void build_edges(mobj_t *probe)
 {
     int k, d;
+
+    kept_straight = kept_diagonal = dropped_wall = dropped_body = 0;
+    memset(edges, 0, grid_w * grid_h);
 
     for (k = 0; k < grid_w * grid_h; k++)
     {
         int ax = k % grid_w, ay = k / grid_w;
 
-        edges[k] = 0;
         if (!walk[k])
         {
             continue;
         }
-        for (d = 0; d < 8; d++)
+        /* +x and +y only: -x and -y are the same pairs seen from the other
+         * end, and crossing is symmetric. */
+        for (d = 0; d < 4; d += 2)
         {
             int nx = ax + ROUTE_DX[d];
             int ny = ay + ROUTE_DY[d];
+            int ni;
 
-            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+            if (nx >= grid_w || ny >= grid_h)
             {
                 continue;
             }
-            if (!walk[ny * grid_w + nx])
-            {
-                continue;
-            }
-            if (d >= 4 && (!walk[ay * grid_w + nx] || !walk[ny * grid_w + ax]))
+            ni = ny * grid_w + nx;
+            if (!walk[ni])
             {
                 continue;
             }
             if (!can_cross(cell_x(ax), cell_y(ay), cell_x(nx), cell_y(ny)))
             {
+                dropped_wall++;
                 continue;
             }
-            if (!walkable(probe, (cell_x(ax) + cell_x(nx)) / 2,
-                                 (cell_y(ay) + cell_y(ny)) / 2))
+            if (!body_fits(probe, (cell_x(ax) + cell_x(nx)) / 2,
+                                  (cell_y(ay) + cell_y(ny)) / 2, d))
             {
+                dropped_body++;
                 continue;
             }
             edges[k] |= 1 << d;
+            edges[ni] |= 1 << ROUTE_OPPOSITE[d];
+            kept_straight++;
+        }
+    }
+
+    for (k = 0; k < grid_w * grid_h; k++)
+    {
+        int ax = k % grid_w, ay = k / grid_w;
+
+        if (!walk[k])
+        {
+            continue;
+        }
+        /* Two of the four, mirrored, for the same reason as the straights,
+         * and here it is not just an economy - see the symmetry check at the
+         * end of the build for what asking twice cost. */
+        for (d = 4; d < 6; d++)
+        {
+            int nx = ax + ROUTE_DX[d];
+            int ny = ay + ROUTE_DY[d];
+            int across = ROUTE_DX[d] > 0 ? 0 : 1;
+            int along = ROUTE_DY[d] > 0 ? 2 : 3;
+            int ni;
+
+            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+            {
+                continue;
+            }
+            ni = ny * grid_w + nx;
+            if (!walk[ni])
+            {
+                continue;
+            }
+            /* One of the two ways round the corner, open the whole way. */
+            if (!((edges[k] & (1 << across))
+                  && (edges[ay * grid_w + nx] & (1 << along)))
+                && !((edges[k] & (1 << along))
+                     && (edges[ny * grid_w + ax] & (1 << across))))
+            {
+                continue;
+            }
+            if (!can_cross(cell_x(ax), cell_y(ay), cell_x(nx), cell_y(ny)))
+            {
+                dropped_wall++;
+                continue;
+            }
+            if (!body_fits(probe, (cell_x(ax) + cell_x(nx)) / 2,
+                                  (cell_y(ay) + cell_y(ny)) / 2, d))
+            {
+                dropped_body++;
+                continue;
+            }
+            edges[k] |= 1 << d;
+            edges[ni] |= 1 << ROUTE_OPPOSITE[d];
+            kept_diagonal++;
         }
     }
 }
 
-/* Rebuild when the level changed. Keyed on the `lines` array, which a level
- * reload reallocates - a stale field would route through a map that is gone. */
-static void ensure_built(mobj_t *probe)
+/* Build the field once, with `allow_damage` as it stands. False when there is
+ * no field to be had; *no_seed says the reason was that no standing spot at
+ * the exit could be reached, which is the one failure worth retrying. */
+static boolean build_field(mobj_t *probe, boolean *no_seed)
 {
     fixed_t minx = 0, miny = 0, maxx = 0, maxy = 0;
     api_point_t spots[API_MAX_EXIT_SPOTS];
     int n_spots;
     int i, cx, cy, seed;
+    int build_ms;
     int *queue;
     unsigned short *reach;
 
-    if (field != NULL && built_for == (void *)lines && built_count == numlines)
-    {
-        return;
-    }
+    *no_seed = false;
     free(field);
     field = NULL;
-    if (built_for != (void *)lines)
-    {
-        /* A new level: try the dry route again. */
-        allow_damage = false;
-    }
-    built_for = (void *)lines;
-    built_count = numlines;
 
     n_spots = API_ExitSpots(probe, spots, API_MAX_EXIT_SPOTS);
     if (numvertexes <= 0 || n_spots == 0)
     {
         printf("API_Route: no exit line, or nowhere to stand at it\n");
-        return;
+        return false;
     }
     minx = maxx = vertexes[0].x;
     miny = maxy = vertexes[0].y;
@@ -377,7 +483,7 @@ static void ensure_built(mobj_t *probe)
     if (grid_w <= 0 || grid_h <= 0 || grid_w * grid_h > ROUTE_MAX_CELLS)
     {
         printf("API_Route: %dx%d grid is too large for this level\n", grid_w, grid_h);
-        return;
+        return false;
     }
 
     field = malloc(sizeof(unsigned short) * grid_w * grid_h);
@@ -388,7 +494,7 @@ static void ensure_built(mobj_t *probe)
         free(queue);
         free(field);
         field = NULL;
-        return;
+        return false;
     }
     free(walk);
     free(edges);
@@ -402,14 +508,55 @@ static void ensure_built(mobj_t *probe)
         free(queue);
         free(field);
         field = NULL;
-        return;
+        return false;
     }
     for (i = 0; i < grid_w * grid_h; i++)
     {
         field[i] = ROUTE_UNREACHED;
         walk[i] = walkable(probe, cell_x(i % grid_w), cell_y(i / grid_w)) ? 1 : 0;
     }
+    build_ms = I_GetTimeMS();
     build_edges(probe);
+    build_ms = I_GetTimeMS() - build_ms;
+    /* Every step has to exist from both ends. A traverse between two points
+     * is not bit-for-bit the same run in reverse, so asking the question from
+     * each end and believing both answers produced 128 one-way steps on E1M1
+     * - and a breadth-first field over a graph like that has local minima, a
+     * cell one step further from the exit than its neighbour with no step to
+     * it. The descent stops dead and the agent is told there is no route at
+     * all. Both directions are written from one test now; this is what says
+     * so, and it costs one pass over the grid. */
+    {
+        int bad = 0, k2, d2;
+
+        for (k2 = 0; k2 < grid_w * grid_h; k2++)
+        {
+            for (d2 = 0; d2 < 8; d2++)
+            {
+                int nx2, ny2;
+
+                if (!(edges[k2] & (1 << d2)))
+                {
+                    continue;
+                }
+                nx2 = k2 % grid_w + ROUTE_DX[d2];
+                ny2 = k2 / grid_w + ROUTE_DY[d2];
+                if (nx2 < 0 || ny2 < 0 || nx2 >= grid_w || ny2 >= grid_h
+                    || !(edges[ny2 * grid_w + nx2] & (1 << ROUTE_OPPOSITE[d2])))
+                {
+                    bad++;
+                }
+            }
+        }
+        if (bad > 0)
+        {
+            printf("API_Route: %d steps exist one way and not the other - the field "
+                   "will have dead ends in it\n", bad);
+        }
+    }
+    printf("API_Route: %d straight steps and %d diagonal ones; %d dropped by a wall, "
+           "%d for no room for a body\n",
+           kept_straight, kept_diagonal, dropped_wall, dropped_body);
 
     /* WHICH walkable cells the player can actually get to.
      *
@@ -426,7 +573,7 @@ static void ensure_built(mobj_t *probe)
         free(queue);
         free(field);
         field = NULL;
-        return;
+        return false;
     }
     reach = malloc(sizeof(unsigned short) * grid_w * grid_h);
     if (reach == NULL)
@@ -434,7 +581,7 @@ static void ensure_built(mobj_t *probe)
         free(queue);
         free(field);
         field = NULL;
-        return;
+        return false;
     }
     flood(reach, cy * grid_w + cx, queue);
 
@@ -460,24 +607,57 @@ static void ensure_built(mobj_t *probe)
     reach = NULL;
     if (seed < 0)
     {
-        if (!allow_damage)
+        int walkable_cells = 0, reached = 0;
+
+        for (i = 0; i < grid_w * grid_h; i++)
         {
-            /* Some levels have no dry path. Rather than report no route at
-             * all, walk through the slime and let the agent deal with it. */
-            printf("API_Route: no dry path to the exit; allowing damaging floor\n");
-            allow_damage = true;
-            built_for = NULL;
-            free(queue);
-            free(field);
-            field = NULL;
-            ensure_built(probe);
-            return;
+            walkable_cells += walk[i] != 0;
+            reached += reachable[i] != ROUTE_UNREACHED;
         }
-        printf("API_Route: none of the %d standing spots at the exit is reachable\n", n_spots);
+        printf("API_Route: none of the %d standing spots at the exit is in the %d cells "
+               "the player can reach, of %d walkable%s\n",
+               n_spots, reached, walkable_cells,
+               allow_damage ? " (damaging floor allowed)" : "");
+        /* How big the exit's OWN island is. A handful of cells means the spot
+         * search put the exit in a sealed pocket and the bug is here. A whole
+         * region means the level really is in two pieces as far as walking is
+         * concerned, and the way across is a teleporter or a wall some switch
+         * lowers - neither of which is geometry, so no distance field over
+         * geometry will ever find it. */
+        for (i = 0; i < n_spots; i++)
+        {
+            int sx, sy;
+
+            if (cell_of(spots[i].x, spots[i].y, &sx, &sy) && walk[sy * grid_w + sx])
+            {
+                int got = flood(field, sy * grid_w + sx, queue);
+
+                printf("API_Route: the exit's own side of the level is %d cells; "
+                       "if that is a whole region, the way across is not walkable "
+                       "(a teleporter, or a wall a switch lowers)\n", got);
+                break;
+            }
+        }
+        for (i = 0; i < n_spots; i++)
+        {
+            int sx, sy;
+
+            if (!cell_of(spots[i].x, spots[i].y, &sx, &sy))
+            {
+                printf("API_Route:   spot %d at %d,%d is off the grid\n", i,
+                       spots[i].x >> FRACBITS, spots[i].y >> FRACBITS);
+                continue;
+            }
+            printf("API_Route:   spot %d at %d,%d is %s\n", i,
+                   spots[i].x >> FRACBITS, spots[i].y >> FRACBITS,
+                   !walk[sy * grid_w + sx] ? "not somewhere the player fits"
+                                           : "walled off from the player");
+        }
+        *no_seed = true;
         free(queue);
         free(field);
         field = NULL;
-        return;
+        return false;
     }
     {
         /* Sequenced deliberately: C does not order function arguments, and
@@ -486,13 +666,57 @@ static void ensure_built(mobj_t *probe)
         int got = flood(field, seed, queue);
         int at_spawn = field[cy * grid_w + cx];
 
-        printf("API_Route: %dx%d cells at %d units, %d reachable, exit %d cells from the spawn%s\n",
+        printf("API_Route: %dx%d cells at %d units, %d reachable, exit %d cells from the "
+               "spawn%s, %d ms to map the steps between them\n",
                grid_w, grid_h, ROUTE_CELL, got,
                at_spawn == ROUTE_UNREACHED ? -1 : at_spawn,
-               allow_damage ? " (through damaging floor)" : "");
+               allow_damage ? " (through damaging floor)" : "", build_ms);
     }
 
     free(queue);
+    return true;
+}
+
+/* Rebuild when the level changed. Keyed on the `lines` array, which a level
+ * reload reallocates - a stale field would route through a map that is gone. */
+static void ensure_built(mobj_t *probe)
+{
+    boolean no_seed;
+
+    if (field != NULL && built_for == (void *)lines && built_count == numlines)
+    {
+        return;
+    }
+    if (built_for != (void *)lines)
+    {
+        /* A new level: try the dry route again. */
+        allow_damage = false;
+    }
+    built_for = (void *)lines;
+    built_count = numlines;
+
+    if (build_field(probe, &no_seed) || !no_seed)
+    {
+        return;
+    }
+    /* Some levels have no dry path. Rather than report no route at all, walk
+     * through the slime and let the agent deal with it.
+     *
+     * This retry used to clear built_for and call back into ensure_built,
+     * which saw a level it had not built and reset allow_damage to false on
+     * the way in - so it asked the same question again, got the same answer,
+     * and recursed until the engine stopped answering. E1M2, whose exit is
+     * across nukage, hung on the first observation. */
+    if (!allow_damage)
+    {
+        printf("API_Route: no dry path to the exit; allowing damaging floor\n");
+        allow_damage = true;
+        if (build_field(probe, &no_seed))
+        {
+            return;
+        }
+    }
+    printf("API_Route: nowhere reachable to stand at the exit\n");
 }
 
 /* Could the player WALK to (x,y) in a straight line from where they are?
@@ -560,7 +784,66 @@ boolean API_Route(mobj_t *player, api_route_t *out)
     at = cy * grid_w + cx;
     if (field[at] == ROUTE_UNREACHED)
     {
-        return false;
+        /* The player is standing somewhere the grid does not cover.
+         *
+         * That happens, and no amount of tuning the crossing tests will stop
+         * it happening: the grid is a 32-unit sample of a level built from
+         * arbitrary polygons, so there are always nooks a player can walk into
+         * that no cell centre lands in, and pockets the crossing tests judge
+         * sealed. Reporting no route at all there is the worst answer - the
+         * agent loses the exit entirely at the exact moment it is lost - and
+         * it is how a follower came to spend the rest of an episode in a
+         * corner 400 units from its own spawn.
+         *
+         * So: find the nearest cell that IS on the route and that the player
+         * can walk straight to, and steer back onto it. */
+        int best = -1, bestd = 0, r;
+
+        for (r = 1; r <= ROUTE_RECOVER && best < 0; r++)
+        {
+            int dx, dy;
+
+            for (dy = -r; dy <= r; dy++)
+            {
+                for (dx = -r; dx <= r; dx++)
+                {
+                    int nx = cx + dx, ny = cy + dy, ni, dist;
+
+                    /* The ring at this radius only; inner ones are done. */
+                    if (abs(dx) != r && abs(dy) != r)
+                    {
+                        continue;
+                    }
+                    if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+                    {
+                        continue;
+                    }
+                    ni = ny * grid_w + nx;
+                    if (field[ni] == ROUTE_UNREACHED
+                        || !can_walk_to(player, cell_x(nx), cell_y(ny)))
+                    {
+                        continue;
+                    }
+                    dist = field[ni];
+                    if (best < 0 || dist < bestd)
+                    {
+                        best = ni;
+                        bestd = dist;
+                    }
+                }
+            }
+        }
+        if (best < 0)
+        {
+            return false;
+        }
+        out->cells = field[best];
+        out->have_step = true;
+        out->blocked = false;
+        out->can_open = false;
+        out->x = cell_x(best % grid_w);
+        out->y = cell_y(best / grid_w);
+        return true;
     }
 
     out->cells = field[at];
