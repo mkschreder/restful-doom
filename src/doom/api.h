@@ -12,8 +12,12 @@
 #define NUMKEYS   256
 #define NUMDESCRIPTIONS 125
 
-int keys_down[NUMKEYS];
-int target_angle;
+/* Defined once in api.c. These used to be tentative definitions in the
+ * header, which only linked because pre-GCC-10 defaulted to -fcommon; every
+ * translation unit that included api.h emitted its own, and the linker
+ * silently merged them. */
+extern int keys_down[NUMKEYS];
+extern int target_angle;
 
 void API_Init(int port);
 void API_RunIO();

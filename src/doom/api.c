@@ -20,6 +20,9 @@ extern api_obj_description_t api_descriptors[];
 char path[100];
 char hud_message[512];
 
+int keys_down[NUMKEYS];
+int target_angle;
+
 TCPsocket server_sd;
 TCPsocket client_sd;
 SDLNet_SocketSet set;
