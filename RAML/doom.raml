@@ -45,9 +45,38 @@ baseUri: http://localhost:6666
                 "clearance": {"ahead": 320, "right": 64, "behind": 0,
                               "left": 128, "aheadRight": 320, "aheadLeft": 64},
                 "exit": {"distance": 2217, "bearing": -53, "kind": "switch",
-                         "clearance": 0},
+                         "clearance": 0, "spot": {"x": 2944, "y": -4768},
+                         "pathDistance": 3456, "routeBearing": 7,
+                         "routeDistance": 35, "routeClearance": 16,
+                         "blockedBy": {"kind": "door", "bearing": 7,
+                                       "distance": 17}},
                 "events": [{"tic": 118, "type": "hurt", "amount": 15}],
                 "done": false, "outcome": "alive"
+              }
+
+/api/route:
+  description: |
+    The route's own working, for when a bearing and a wall disagree.
+
+    distance is in grid cells to the exit; steps lists all eight neighbouring
+    cells with whether the player fits there, whether the step is one they may
+    take, how far that cell is from the exit, and whether they could walk
+    straight at it from where they are standing right now. A route that is
+    wrong and a route the player cannot follow look identical from outside the
+    engine, and this is what tells them apart.
+  get:
+    responses:
+      200:
+        body:
+          application/json:
+            example: |
+              {
+                "cell": 32, "cx": 72, "cy": 76,
+                "centerX": 1520, "centerY": -2448,
+                "walkable": true, "distance": 108,
+                "steps": [{"dx": 1, "dy": 0, "walkable": true, "edge": true,
+                           "distance": 107, "canWalkTo": false}],
+                "aimX": 1520, "aimY": -2448
               }
 
 /api/step:

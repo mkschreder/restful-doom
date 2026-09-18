@@ -493,6 +493,14 @@ api_response_t API_RouteRequest(api_request_t req)
         }
         return API_CreateErrorResponse(405, "Method not allowed");
     }
+    else if (strcmp(path, "api/route") == 0)
+    {
+        if (strcmp(method, "GET") == 0)
+        {
+            return API_GetRouteDebug();
+        }
+        return API_CreateErrorResponse(405, "Method not allowed");
+    }
     else if (strcmp(path, "api/frame") == 0)
     {
         if (strcmp(method, "GET") == 0)

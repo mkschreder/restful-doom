@@ -55,6 +55,12 @@ static unsigned short *field;
  * player can cross. Computed once with the distance field and reused, so the
  * per-observation searches below are array work and no engine queries. */
 static unsigned short *reachable;
+/* Which cells a player can stand in, and which of the eight steps out of each
+ * one they can actually take. These two are the ONE definition of what the
+ * player may do on this grid: every flood fill and every route bearing reads
+ * them and nothing re-derives them, so a field and the path followed down it
+ * can no longer disagree. */
+static unsigned char *walk;
 static unsigned char *edges;  /* 8 bits a cell */
 /* Where the player has been this episode. */
 static unsigned char *visited;
@@ -235,7 +241,7 @@ int API_ExitSpots(mobj_t *probe, api_point_t *out, int max)
 static const int ROUTE_DX[8] = { 1, -1, 0, 0, 1, 1, -1, -1 };
 static const int ROUTE_DY[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
 
-static int flood(mobj_t *probe, unsigned short *out, int seed, int *queue)
+static int flood(unsigned short *out, int seed, int *queue)
 {
     int head = 0, tail = 0, reached = 1, i;
 
@@ -254,29 +260,14 @@ static int flood(mobj_t *probe, unsigned short *out, int seed, int *queue)
 
         for (d = 0; d < 8; d++)
         {
-            int nx = ax + ROUTE_DX[d];
-            int ny = ay + ROUTE_DY[d];
             int ni;
 
-            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+            if (!(edges[at] & (1 << d)))
             {
                 continue;
             }
-            ni = ny * grid_w + nx;
+            ni = (ay + ROUTE_DY[d]) * grid_w + ax + ROUTE_DX[d];
             if (out[ni] != ROUTE_UNREACHED)
-            {
-                continue;
-            }
-            if (!walkable(probe, cell_x(nx), cell_y(ny))
-                || !can_cross(cell_x(ax), cell_y(ay), cell_x(nx), cell_y(ny)))
-            {
-                continue;
-            }
-            /* A diagonal needs both of its orthogonals open too, or the path
-             * squeezes through the corner where two walls meet. */
-            if (d >= 4
-                && (!walkable(probe, cell_x(nx), cell_y(ay))
-                    || !walkable(probe, cell_x(ax), cell_y(ny))))
             {
                 continue;
             }
@@ -284,9 +275,59 @@ static int flood(mobj_t *probe, unsigned short *out, int seed, int *queue)
             queue[tail++] = ni;
             reached++;
         }
-
     }
     return reached;
+}
+
+/* Every step a player can take on this grid, computed once.
+ *
+ * A cell pair is joined when a sight ray between the centres crosses no solid
+ * line AND a 32-unit-wide body fits at the midpoint. The ray alone is what a
+ * route used to be built from, and it is not enough: a ray is a point and
+ * threads gaps a body wedges in. A diagonal additionally needs both of its
+ * orthogonals, or the path squeezes through the corner where two walls meet. */
+static void build_edges(mobj_t *probe)
+{
+    int k, d;
+
+    for (k = 0; k < grid_w * grid_h; k++)
+    {
+        int ax = k % grid_w, ay = k / grid_w;
+
+        edges[k] = 0;
+        if (!walk[k])
+        {
+            continue;
+        }
+        for (d = 0; d < 8; d++)
+        {
+            int nx = ax + ROUTE_DX[d];
+            int ny = ay + ROUTE_DY[d];
+
+            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+            {
+                continue;
+            }
+            if (!walk[ny * grid_w + nx])
+            {
+                continue;
+            }
+            if (d >= 4 && (!walk[ay * grid_w + nx] || !walk[ny * grid_w + ax]))
+            {
+                continue;
+            }
+            if (!can_cross(cell_x(ax), cell_y(ay), cell_x(nx), cell_y(ny)))
+            {
+                continue;
+            }
+            if (!walkable(probe, (cell_x(ax) + cell_x(nx)) / 2,
+                                 (cell_y(ay) + cell_y(ny)) / 2))
+            {
+                continue;
+            }
+            edges[k] |= 1 << d;
+        }
+    }
 }
 
 /* Rebuild when the level changed. Keyed on the `lines` array, which a level
@@ -349,10 +390,26 @@ static void ensure_built(mobj_t *probe)
         field = NULL;
         return;
     }
+    free(walk);
+    free(edges);
+    free(visited);
+    walk = calloc(1, grid_w * grid_h);
+    edges = calloc(1, grid_w * grid_h);
+    visited = calloc(1, grid_w * grid_h);
+    if (walk == NULL || edges == NULL || visited == NULL)
+    {
+        printf("API_Route: out of memory for a %dx%d grid\n", grid_w, grid_h);
+        free(queue);
+        free(field);
+        field = NULL;
+        return;
+    }
     for (i = 0; i < grid_w * grid_h; i++)
     {
         field[i] = ROUTE_UNREACHED;
+        walk[i] = walkable(probe, cell_x(i % grid_w), cell_y(i / grid_w)) ? 1 : 0;
     }
+    build_edges(probe);
 
     /* WHICH walkable cells the player can actually get to.
      *
@@ -379,7 +436,7 @@ static void ensure_built(mobj_t *probe)
         field = NULL;
         return;
     }
-    flood(probe, reach, cy * grid_w + cx, queue);
+    flood(reach, cy * grid_w + cx, queue);
 
     /* The first candidate spot at the exit that the player can reach. */
     seed = -1;
@@ -422,45 +479,11 @@ static void ensure_built(mobj_t *probe)
         field = NULL;
         return;
     }
-    free(edges);
-    edges = calloc(1, grid_w * grid_h);
-    free(visited);
-    visited = calloc(1, grid_w * grid_h);
-    if (edges != NULL)
-    {
-        int k, d;
-
-        for (k = 0; k < grid_w * grid_h; k++)
-        {
-            if (reachable[k] == ROUTE_UNREACHED)
-            {
-                continue;
-            }
-            for (d = 0; d < 8; d++)
-            {
-                int nx = k % grid_w + ROUTE_DX[d];
-                int ny = k / grid_w + ROUTE_DY[d];
-
-                if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
-                {
-                    continue;
-                }
-                if (reachable[ny * grid_w + nx] == ROUTE_UNREACHED)
-                {
-                    continue;
-                }
-                if (can_cross(cell_x(k % grid_w), cell_y(k / grid_w), cell_x(nx), cell_y(ny)))
-                {
-                    edges[k] |= 1 << d;
-                }
-            }
-        }
-    }
     {
         /* Sequenced deliberately: C does not order function arguments, and
          * reading the field in the same printf that fills it reported the
          * spawn as unreachable on a field that had not been built yet. */
-        int got = flood(probe, field, seed, queue);
+        int got = flood(field, seed, queue);
         int at_spawn = field[cy * grid_w + cx];
 
         printf("API_Route: %dx%d cells at %d units, %d reachable, exit %d cells from the spawn%s\n",
@@ -482,6 +505,8 @@ static void ensure_built(mobj_t *probe)
  * decisions walking forward at a bearing of -1 without moving. */
 static fixed_t walk_probe_z;
 static boolean walk_blocked;
+static line_t *walk_block_line;
+static fixed_t walk_block_frac;
 
 static boolean PTR_WalkTraverse(intercept_t *in)
 {
@@ -490,6 +515,8 @@ static boolean PTR_WalkTraverse(intercept_t *in)
     if (ld->backsector == NULL || ld->frontsector == NULL || (ld->flags & ML_BLOCKING))
     {
         walk_blocked = true;
+        walk_block_line = ld;
+        walk_block_frac = in->frac;
         return false;
     }
     P_LineOpening(ld);
@@ -500,6 +527,8 @@ static boolean PTR_WalkTraverse(intercept_t *in)
     if (openrange < 56 * FRACUNIT || openbottom - walk_probe_z > 24 * FRACUNIT)
     {
         walk_blocked = true;
+        walk_block_line = ld;
+        walk_block_frac = in->frac;
         return false;
     }
     return true;
@@ -508,6 +537,7 @@ static boolean PTR_WalkTraverse(intercept_t *in)
 static boolean can_walk_to(mobj_t *player, fixed_t x, fixed_t y)
 {
     walk_blocked = false;
+    walk_block_line = NULL;
     walk_probe_z = player->z;
     P_PathTraverse(player->x, player->y, x, y, PT_ADDLINES, PTR_WalkTraverse);
     return !walk_blocked;
@@ -535,6 +565,8 @@ boolean API_Route(mobj_t *player, api_route_t *out)
 
     out->cells = field[at];
     out->have_step = false;
+    out->blocked = false;
+    out->can_open = false;
     if (field[at] == 0)
     {
         return true;
@@ -543,13 +575,18 @@ boolean API_Route(mobj_t *player, api_route_t *out)
     /* Walk downhill and aim at the furthest point still in a straight line
      * from the player.
      *
+     * Only steps the player can actually take are considered. A cell's
+     * distance being one less than this one's does NOT mean the two are
+     * joined: two cells either side of a thin wall differ by one all the way
+     * along it, and a descent that ignores `edges` walks straight into it. The
+     * symptom was a route bearing pointing at a wall twenty units ahead, held
+     * perfectly steady while the player stood still.
+     *
      * The lookahead is what makes following smooth - aiming at the very next
      * cell flips the target every time a boundary is crossed - but a fixed
      * lookahead cuts corners: where the path bends, the straight line to a
-     * point four cells along goes through the wall it bends around. Measured,
-     * that wedged a follower against a corridor corner at a route bearing of
-     * zero for 275 decisions. So the candidate is only accepted while the
-     * player could actually walk straight at it. */
+     * point four cells along goes through the wall it bends around. So the
+     * candidate is only accepted while the player could walk straight at it. */
     bx = cx;
     by = cy;
     {
@@ -562,15 +599,13 @@ boolean API_Route(mobj_t *player, api_route_t *out)
 
             for (d = 0; d < 8; d++)
             {
-                int nx = px + ROUTE_DX[d];
-                int ny = py + ROUTE_DY[d];
                 int ni;
 
-                if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+                if (!(edges[py * grid_w + px] & (1 << d)))
                 {
                     continue;
                 }
-                ni = ny * grid_w + nx;
+                ni = (py + ROUTE_DY[d]) * grid_w + px + ROUTE_DX[d];
                 if (field[ni] == ROUTE_UNREACHED)
                 {
                     continue;
@@ -602,13 +637,46 @@ boolean API_Route(mobj_t *player, api_route_t *out)
             }
         }
 
-        /* Nothing further along was in a straight line - the player is
-         * hugging a wall, which is exactly when a bearing is most needed. Aim
-         * at the next cell anyway: it is 32 units away and the engine slides
-         * a player along what they brush. Returning no bearing here left the
-         * follower with nothing to steer by at every corner. */
+        /* Not even the next cell was straight ahead. Say WHAT is in the way.
+         *
+         * The field deliberately runs through shut doors, because a player
+         * opens them; so "the route says go east and the player cannot" is the
+         * normal state of affairs at every door in the game, and an agent that
+         * is only told a bearing can do nothing but walk into it. Measured on
+         * E1M1: the route was right, the door at (1519,-2448) was shut, and the
+         * follower pressed forward against it until the episode ran out.
+         *
+         * Aiming at the next cell anyway was tried instead, on the theory that
+         * the engine slides a player along what they brush, and it is how a
+         * follower came to spend two hundred and seventy-five decisions pressed
+         * into a corner at a bearing of zero. */
         if (bx == cx && by == cy && first >= 0)
         {
+            fixed_t tx = cell_x(first % grid_w);
+            fixed_t ty = cell_y(first / grid_w);
+
+            if (!can_walk_to(player, tx, ty) && walk_block_line != NULL)
+            {
+                line_t *ld = walk_block_line;
+
+                out->blocked = true;
+                out->can_open = ld->special != 0;
+                out->block_x = player->x + FixedMul(tx - player->x, walk_block_frac);
+                out->block_y = player->y + FixedMul(ty - player->y, walk_block_frac);
+            }
+            /* Off the middle of their own cell and hugging something: steer
+             * back to that middle, which is at most half a cell away and is a
+             * place the player is known to fit. Only worth saying when it is
+             * far enough to be a direction rather than noise. */
+            if (P_AproxDistance(cell_x(cx) - player->x, cell_y(cy) - player->y)
+                    > 12 * FRACUNIT
+                && can_walk_to(player, cell_x(cx), cell_y(cy)))
+            {
+                out->have_step = true;
+                out->x = cell_x(cx);
+                out->y = cell_y(cy);
+                return true;
+            }
             bx = first % grid_w;
             by = first / grid_w;
         }
@@ -622,6 +690,66 @@ boolean API_Route(mobj_t *player, api_route_t *out)
     out->x = cell_x(bx);
     out->y = cell_y(by);
     return true;
+}
+
+cJSON *API_RouteDebug(mobj_t *player)
+{
+    cJSON *root, *arr;
+    api_route_t r;
+    int cx, cy, at, d;
+
+    if (player == NULL)
+    {
+        return NULL;
+    }
+    ensure_built(player);
+    root = cJSON_CreateObject();
+    if (field == NULL || !cell_of(player->x, player->y, &cx, &cy))
+    {
+        cJSON_AddStringToObject(root, "error", "no field, or the player is off the grid");
+        return root;
+    }
+    at = cy * grid_w + cx;
+    cJSON_AddNumberToObject(root, "cell", ROUTE_CELL);
+    cJSON_AddNumberToObject(root, "cx", cx);
+    cJSON_AddNumberToObject(root, "cy", cy);
+    cJSON_AddNumberToObject(root, "centerX", cell_x(cx) >> FRACBITS);
+    cJSON_AddNumberToObject(root, "centerY", cell_y(cy) >> FRACBITS);
+    cJSON_AddBoolToObject(root, "walkable", walk[at] != 0);
+    cJSON_AddNumberToObject(root, "distance",
+                            field[at] == ROUTE_UNREACHED ? -1 : field[at]);
+
+    arr = cJSON_CreateArray();
+    for (d = 0; d < 8; d++)
+    {
+        int nx = cx + ROUTE_DX[d];
+        int ny = cy + ROUTE_DY[d];
+        cJSON *o;
+
+        if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+        {
+            continue;
+        }
+        o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "dx", ROUTE_DX[d]);
+        cJSON_AddNumberToObject(o, "dy", ROUTE_DY[d]);
+        cJSON_AddBoolToObject(o, "walkable", walk[ny * grid_w + nx] != 0);
+        cJSON_AddBoolToObject(o, "edge", (edges[at] & (1 << d)) != 0);
+        cJSON_AddNumberToObject(o, "distance",
+                                field[ny * grid_w + nx] == ROUTE_UNREACHED
+                                    ? -1 : field[ny * grid_w + nx]);
+        cJSON_AddBoolToObject(o, "canWalkTo",
+                              can_walk_to(player, cell_x(nx), cell_y(ny)));
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_AddItemToObject(root, "steps", arr);
+
+    if (API_Route(player, &r) && r.have_step)
+    {
+        cJSON_AddNumberToObject(root, "aimX", r.x >> FRACBITS);
+        cJSON_AddNumberToObject(root, "aimY", r.y >> FRACBITS);
+    }
+    return root;
 }
 
 void API_RouteForgetVisited(void)

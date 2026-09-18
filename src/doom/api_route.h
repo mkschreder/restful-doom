@@ -10,6 +10,16 @@ typedef struct {
     boolean have_step;
     fixed_t x;
     fixed_t y;
+    /* What stands between the player and that next step, when something does.
+     * A route may legitimately run through a shut door - a player opens it -
+     * so the field treats one as passable and it falls to the agent to open
+     * it. It cannot do that without being told the door is there. */
+    boolean blocked;
+    /* Whether pressing use against it does anything: a door, a lift or a
+     * switch, as opposed to plain wall. */
+    boolean can_open;
+    fixed_t block_x;
+    fixed_t block_y;
 } api_route_t;
 
 /* Where to go next to make progress toward the exit. False when the level has
@@ -27,6 +37,12 @@ typedef struct {
  * supplies the radius the positions are tested against. Returns how many were
  * written. */
 int API_ExitSpots(mobj_t *probe, api_point_t *out, int max);
+
+/* The descent, cell by cell, as JSON: where the player is on the grid, what
+ * every neighbouring step costs, which of them the player may take, and which
+ * one the route chose. Enough to tell "the route is wrong" from "the player
+ * cannot follow it", which from outside the engine look identical. */
+cJSON *API_RouteDebug(mobj_t *player);
 
 /* Where the player has been this episode, for the frontier search. */
 void API_RouteMarkVisited(mobj_t *player);

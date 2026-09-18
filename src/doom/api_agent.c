@@ -712,6 +712,29 @@ static void DescribeExit(cJSON *root)
                                                               player->y - route.y)));
                     cJSON_AddNumberToObject(o, "routeClearance", Clearance(player, rrel));
                 }
+                // What is in the way, when the route says one thing and the
+                // player's body says another. Almost always a shut door: the
+                // route runs through doors because a player opens them.
+                if (route.blocked)
+                {
+                    angle_t ba = R_PointToAngle2(player->x, player->y,
+                                                 route.block_x, route.block_y);
+                    int brel = angleToDegrees(ba - player->angle);
+                    cJSON *b = cJSON_CreateObject();
+
+                    if (brel > 180)
+                    {
+                        brel -= 360;
+                    }
+                    cJSON_AddStringToObject(b, "kind",
+                                            route.can_open ? "door" : "wall");
+                    cJSON_AddNumberToObject(b, "bearing", brel);
+                    cJSON_AddNumberToObject(
+                        b, "distance",
+                        (int)API_FixedToFloat(P_AproxDistance(
+                            player->x - route.block_x, player->y - route.block_y)));
+                    cJSON_AddItemToObject(o, "blockedBy", b);
+                }
             }
         }
 
@@ -849,6 +872,23 @@ static char *Base64(const byte *in, int len)
 // The explored map: what the agent knows about where it can go and where it
 // has been. Served separately from the frame because a viewer wants both and
 // a policy wants neither.
+api_response_t API_GetRouteDebug(void)
+{
+    mobj_t *player = players[consoleplayer].mo;
+    cJSON *root;
+
+    if (player == NULL)
+    {
+        return API_CreateErrorResponse(404, "no player");
+    }
+    root = API_RouteDebug(player);
+    if (root == NULL)
+    {
+        return API_CreateErrorResponse(500, "no route information");
+    }
+    return (api_response_t) {200, root};
+}
+
 api_response_t API_GetMap(void)
 {
     api_map_t map;

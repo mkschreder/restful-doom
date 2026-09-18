@@ -31,6 +31,9 @@ between.
 | `POST /api/step` | apply actions, run exactly N tics, answer with the state that results |
 | `POST /api/episode` | restart a level reproducibly, seed included |
 | `GET /api/frame` | the 320x200 framebuffer and the palette in effect |
+| `GET /api/map` | the walkable grid and the distance to the exit across it |
+| `GET /api/route` | the route's working at the player's own cell, when a bearing and a wall disagree |
+| `GET /api/world/movetest` | whether a body could stand at a point, and which of P_TryMove's rules says no |
 
 ```
 src/restful-doom -iwad doom1.wad -apiport 6666 -apilockstep -noblit     -warp 1 1 -skill 4 -nosound -nomusic
