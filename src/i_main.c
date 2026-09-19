@@ -36,6 +36,14 @@ void D_DoomMain (void);
 
 int main(int argc, char **argv)
 {
+    // Line-buffered from the very first write, before anything has been
+    // printed - setvbuf is only defined that way, and an agent runs this
+    // engine as a subprocess with its output on a pipe, which libc otherwise
+    // makes block-buffered. Everything the API's route builder says about
+    // what it could and could not reach then sits in a buffer until the
+    // process exits, and a subprocess that gets killed never does.
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     // save arguments
 
     myargc = argc;
