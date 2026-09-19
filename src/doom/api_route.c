@@ -1700,13 +1700,72 @@ static boolean PTR_WalkTraverse(intercept_t *in)
     return true;
 }
 
+/* Whether the straight line between two points stays off damaging floor.
+ *
+ * The field routes around nukage when it can, cell by cell, and then the
+ * follower is handed a waypoint four cells ahead and walks the STRAIGHT line
+ * to it - which cuts the corner the route went round. Measured on E1M3, whose
+ * route to the exit after the blue key is entirely dry: the player took a
+ * hundred and four points of nukage damage following it and died at decision
+ * 394. Sampling is enough, at half the player's width: a pool one sample wide
+ * is not a pool. */
+static boolean dry_line(fixed_t x1, fixed_t y1, fixed_t x2, fixed_t y2)
+{
+    fixed_t dx = x2 - x1, dy = y2 - y1;
+    fixed_t len = P_AproxDistance(dx, dy);
+    int steps, i, wet = 0;
+
+    if (len <= 0)
+    {
+        return true;
+    }
+    steps = (len >> FRACBITS) / 16 + 1;
+    for (i = 1; i <= steps; i++)
+    {
+        subsector_t *ss = R_PointInSubsector(x1 + dx * i / steps, y1 + dy * i / steps);
+
+        if (ss != NULL && ss->sector != NULL && hurts(ss->sector->special))
+        {
+            wet++;
+            /* A splash is not a pool. Sixty-four units of it is under a
+             * second of walking and costs one tick of damage at worst, and
+             * refusing every line that clips one is how a follower came to
+             * stand two cells short of E1M2's exit for a thousand decisions:
+             * the cell path round it exists, and no straight line to any
+             * waypoint along it is completely dry. */
+            if (wet > 4)
+            {
+                return false;
+            }
+        }
+        else
+        {
+            wet = 0;
+        }
+    }
+    return true;
+}
+
 static boolean can_walk_to(mobj_t *player, fixed_t x, fixed_t y)
 {
     walk_blocked = false;
     walk_block_line = NULL;
     walk_probe_z = player->z;
     P_PathTraverse(player->x, player->y, x, y, PT_ADDLINES, PTR_WalkTraverse);
-    return !walk_blocked;
+    if (walk_blocked)
+    {
+        return false;
+    }
+    /* And not through the slime, unless the route has already given up on
+     * staying dry, or the player is standing in it - where every way out is
+     * wet and refusing them all leaves the agent with no route at the one
+     * moment it is losing health for want of one. */
+    if (!allow_damage && !hurts(player->subsector->sector->special)
+        && !dry_line(player->x, player->y, x, y))
+    {
+        return false;
+    }
+    return true;
 }
 
 /* The nearest line whose special operates this sector's tag: the switch that
@@ -1908,6 +1967,48 @@ boolean API_Route(mobj_t *player, api_route_t *out)
                     {
                         best = ni;
                         bestd = dist;
+                    }
+                }
+            }
+        }
+        if (best < 0)
+        {
+            /* Nothing the player can walk straight at. Take the nearest cell
+             * that is on the field at all and aim at that.
+             *
+             * Standing still is the one answer that is always wrong here, and
+             * it is what "no route" means to the agent above. Measured on
+             * E1M3: the player walked into a nukage pool, every cell in it is
+             * unwalkable while the route is trying to stay dry, so the ring
+             * search found nothing, the observation carried no route - and
+             * the scripted player strafed into the same wall seventy-eight
+             * times and died there with the pool's edge forty units away. A
+             * bearing that is roughly right beats no bearing. */
+            for (r = 1; r <= ROUTE_RECOVER * 2 && best < 0; r++)
+            {
+                int dx, dy;
+
+                for (dy = -r; dy <= r; dy++)
+                {
+                    for (dx = -r; dx <= r; dx++)
+                    {
+                        int nx = cx + dx, ny = cy + dy, ni;
+
+                        if ((abs(dx) != r && abs(dy) != r) || nx < 0 || ny < 0
+                            || nx >= grid_w || ny >= grid_h)
+                        {
+                            continue;
+                        }
+                        ni = ny * grid_w + nx;
+                        if (field[ni] == ROUTE_UNREACHED)
+                        {
+                            continue;
+                        }
+                        if (best < 0 || field[ni] < bestd)
+                        {
+                            best = ni;
+                            bestd = field[ni];
+                        }
                     }
                 }
             }
