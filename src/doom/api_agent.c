@@ -532,23 +532,38 @@ static void DescribeSurroundings(cJSON *root)
     for (i = 0; i < n; i++)
     {
         mobj_t *t = near[i].thing;
-        cJSON *o = DescribeThing(player, t);
+        boolean in_sight = P_CheckSight(player, t);
+        cJSON *o;
+
+        // Under fair play a thing behind a wall is not in the observation.
+        //
+        // It was there with `visible: false` beside it, which is a kindness
+        // to a reader and a leak to a policy: the count alone tells an agent
+        // that a room it has not entered has seven monsters in it, and the
+        // entries carry their exact bearings and distances. A player has
+        // sound and nothing else. Keeping only what can be seen costs the
+        // observation nothing it was honestly entitled to.
+        if (API_RouteIsFair() && !in_sight)
+        {
+            continue;
+        }
+        o = DescribeThing(player, t);
 
         switch (near[i].kind)
         {
             case NEAR_THREAT:
                 cJSON_AddNumberToObject(o, "health", t->health);
-                cJSON_AddBoolToObject(o, "visible", P_CheckSight(player, t));
+                cJSON_AddBoolToObject(o, "visible", in_sight);
                 cJSON_AddBoolToObject(o, "targetingMe", t->target == player);
                 cJSON_AddItemToArray(threats, o);
                 break;
             case NEAR_HAZARD:
                 cJSON_AddNumberToObject(o, "health", t->health);
-                cJSON_AddBoolToObject(o, "visible", P_CheckSight(player, t));
+                cJSON_AddBoolToObject(o, "visible", in_sight);
                 cJSON_AddItemToArray(hazards, o);
                 break;
             default:
-                cJSON_AddBoolToObject(o, "visible", P_CheckSight(player, t));
+                cJSON_AddBoolToObject(o, "visible", in_sight);
                 cJSON_AddItemToArray(pickups, o);
                 break;
         }
@@ -688,13 +703,28 @@ static void DescribeExit(cJSON *root)
             best_dist = d;
         }
     }
+    // Under fair play, an exit the player has never laid eyes on is not in
+    // the observation at all.
+    //
+    // Everything else here - how far it is, which way, how much clear floor
+    // that way - is knowledge of a room nobody has been in. Reporting it from
+    // the first tic is what turns the level into a line to follow, and it is
+    // the one thing a player genuinely cannot have. The exit appears the
+    // moment its own wall has been drawn, which is exactly when a player
+    // would see it too.
+    if (best != NULL && API_RouteIsFair() && !(best->flags & ML_MAPPED))
+    {
+        best = NULL;
+    }
+    {
+        cJSON *o = cJSON_CreateObject();
+
     if (best != NULL)
     {
         fixed_t mx = (best->v1->x + best->v2->x) / 2;
         fixed_t my = (best->v1->y + best->v2->y) / 2;
         angle_t a = R_PointToAngle2(player->x, player->y, mx, my);
         int rel = angleToDegrees(a - player->angle);
-        cJSON *o = cJSON_CreateObject();
 
         if (rel > 180)
         {
@@ -776,9 +806,12 @@ static void DescribeExit(cJSON *root)
                 cJSON_Delete(spot);
             }
         }
+    }
 
-
-        // The way a player would actually WALK there: how many rooms away the
+        // Where to go NEXT, which exists whether or not the exit itself has
+        // been found: the route leads to the exit once it is known, to a key
+        // or a switch when one is in the way, and otherwise to the edge of
+        // what has been explored.: how many rooms away the
         // exit is, and the bearing to the next doorway on the route. The
         // straight-line bearing above is kept because it is what a player
         // facing the right way sees, but it points through walls and an agent
@@ -795,7 +828,11 @@ static void DescribeExit(cJSON *root)
                 // locked door gives an agent two jobs, and the route does the
                 // first one for it - but calling a key "the exit" would be a
                 // lie the agent has no way to catch.
-                if (route.goal_switch)
+                if (route.goal_frontier)
+                {
+                    cJSON_AddStringToObject(o, "goal", "unexplored");
+                }
+                else if (route.goal_switch)
                 {
                     cJSON_AddStringToObject(o, "goal", "switch");
                 }
@@ -866,7 +903,15 @@ static void DescribeExit(cJSON *root)
             }
         }
 
-        cJSON_AddItemToObject(root, "exit", o);
+        if (o->child != NULL)
+        {
+            cJSON_AddItemToObject(root, "exit", o);
+        }
+        else
+        {
+            cJSON_Delete(o);
+        }
+    }
 
     // The nearest place the player has not been, and the way there. This is
     // what makes a level explorable rather than wandered: the search crosses
@@ -890,7 +935,6 @@ static void DescribeExit(cJSON *root)
             cJSON_AddNumberToObject(f, "clearance", Clearance(player, frel));
             cJSON_AddItemToObject(root, "unexplored", f);
         }
-    }
     }
 }
 
@@ -1158,6 +1202,21 @@ api_response_t API_PostEpisode(cJSON *req)
     else
     {
         pending_start_distance = -1;
+    }
+
+    val = cJSON_GetObjectItem(req, "mapKnowledge");
+    if (val != NULL)
+    {
+        if (!cJSON_IsString(val)
+            || (strcmp(val->valuestring, "seen") != 0
+                && strcmp(val->valuestring, "full") != 0))
+        {
+            return API_CreateErrorResponse(400, "mapKnowledge must be \"seen\" or \"full\"");
+        }
+        // "full" is a CONTROL, not a mode to play in: it hands the agent a
+        // distance field over rooms nobody has entered. It exists so the
+        // honest route can be measured against it.
+        API_RouteFairPlay(strcmp(val->valuestring, "seen") == 0);
     }
 
     val = cJSON_GetObjectItem(req, "seed");

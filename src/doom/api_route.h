@@ -37,6 +37,10 @@ typedef struct {
      * rather than the exit or a key. Same idea as `goal_key`: the level's own
      * next objective, and calling it "the exit" would be a lie. */
     boolean goal_switch;
+    /* Whether this route leads to unexplored ground rather than to anything
+     * the player has found yet. Under fair play this is most of a level: the
+     * exit is not a goal until it has been seen. */
+    boolean goal_frontier;
 } api_route_t;
 
 /* Where to go next to make progress toward the exit. False when the level has
@@ -79,6 +83,12 @@ typedef struct {
     /* w*h bytes: 0 unreachable, 1 reachable, 2 walked. Caller frees. */
     unsigned char *cells;
 } api_map_t;
+
+/* Whether the route may only cross ground the player has seen. Default true;
+ * `false` restores the whole-level distance field, which is a solved map and
+ * is only useful as a control to measure the honest one against. */
+void API_RouteFairPlay(boolean on);
+boolean API_RouteIsFair(void);
 
 /* The explored map, for a viewer. */
 boolean API_RouteMap(api_map_t *out);

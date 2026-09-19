@@ -99,6 +99,37 @@ static int wanted_count;
 static boolean route_goal_switch;
 /* Set when the level has changed under the field and it must be rebuilt. */
 static boolean field_stale;
+/* Whether the route may only cross ground the player has actually laid eyes
+ * on.
+ *
+ * This is the difference between an agent that has been handed the level's
+ * solution and one that has to find it. A distance field flooded over the
+ * whole map answers "which way to the exit" from the first tic of a level
+ * nobody has walked a step of - through rooms behind doors that have not been
+ * opened, past a key whose existence is not yet known. Following it is not
+ * playing DOOM; it is following a line painted on the floor, and a policy
+ * trained against it learns one level's line rather than how to look for a
+ * way out.
+ *
+ * The engine already knows exactly what the player has seen, because the
+ * renderer marks every wall it draws with ML_MAPPED for the automap. That is
+ * the honest map, and it is what this floods over. */
+static boolean fair_play = true;
+/* Per cell: whether the player has seen the sector it is in, and which sector
+ * that is. The second is a lookup built with the grid, so re-deciding the
+ * first as the player explores costs a pass over the cells rather than a pass
+ * over the level's geometry. */
+static unsigned char *seen;
+static int *cell_sector;
+/* How many of the level's lines were on the automap when `seen` was filled. */
+static int seen_from;
+/* Set when the route leads to unexplored ground rather than to the exit, a
+ * key or a switch: the player has not found the way out yet, and looking for
+ * it is the job. */
+static boolean route_goal_frontier;
+/* The unseen cell just beyond the frontier the route is heading for. Walking
+ * into it is what turns it into somewhere seen. */
+static int frontier_step = -1;
 /* The switch the route is leading to, when it is leading to one. */
 static fixed_t route_switch_x, route_switch_y;
 
@@ -516,6 +547,79 @@ int API_ExitSpots(mobj_t *probe, api_point_t *out, int max)
     return n;
 }
 
+/* How many of the level's lines the player has laid eyes on. The renderer
+ * sets ML_MAPPED on every wall segment it draws, so this is the game's own
+ * account of what has been seen, not a second one kept alongside it. */
+static int mapped_lines(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < numlines; i++)
+    {
+        if (lines[i].flags & ML_MAPPED)
+        {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Fill `seen` from the automap: a cell counts as seen when the sector it sits
+ * in has any wall the player has looked at. Sector-grained rather than
+ * cell-grained because that is how a person remembers a building - you see a
+ * room, not a square foot of it - and because a sector is the unit the engine
+ * already tracks. */
+static void mark_seen(mobj_t *probe)
+{
+    unsigned char *sector_seen;
+    int i;
+
+    if (seen == NULL || cell_sector == NULL)
+    {
+        return;
+    }
+    seen_from = mapped_lines();
+    sector_seen = calloc(1, numsectors);
+    if (sector_seen == NULL)
+    {
+        return;
+    }
+    for (i = 0; i < numlines; i++)
+    {
+        if (!(lines[i].flags & ML_MAPPED))
+        {
+            continue;
+        }
+        if (lines[i].frontsector != NULL)
+        {
+            sector_seen[lines[i].frontsector - sectors] = 1;
+        }
+        if (lines[i].backsector != NULL)
+        {
+            sector_seen[lines[i].backsector - sectors] = 1;
+        }
+    }
+    /* And the room the player is standing in, whatever the automap says. A
+     * level's first observation happens before a single frame has been drawn,
+     * so ML_MAPPED is empty and the player could route nowhere at all - not
+     * even out of the room they can plainly see around them. */
+    if (probe != NULL && probe->subsector != NULL && probe->subsector->sector != NULL)
+    {
+        sector_seen[probe->subsector->sector - sectors] = 1;
+    }
+    for (i = 0; i < grid_w * grid_h; i++)
+    {
+        seen[i] = cell_sector[i] >= 0 && sector_seen[cell_sector[i]];
+    }
+    free(sector_seen);
+}
+
+/* Whether the route is allowed to cross this cell at all. */
+static boolean open_to_route(int cell)
+{
+    return walk[cell] && (!fair_play || seen == NULL || seen[cell]);
+}
+
 /* Flood fill `out` from `seed`, 4-connected, through walkable cells a player
  * could cross between. Returns how many cells were reached. */
 /* Eight directions, orthogonals first so a tie prefers a straight move.
@@ -536,6 +640,10 @@ static int flood(unsigned short *out, int seed, int *queue)
     {
         out[i] = ROUTE_UNREACHED;
     }
+    if (!open_to_route(seed))
+    {
+        return 0;
+    }
     out[seed] = 0;
     queue[tail++] = seed;
     while (head < tail)
@@ -554,7 +662,7 @@ static int flood(unsigned short *out, int seed, int *queue)
                 continue;
             }
             ni = (ay + ROUTE_DY[d]) * grid_w + ax + ROUTE_DX[d];
-            if (out[ni] != ROUTE_UNREACHED)
+            if (out[ni] != ROUTE_UNREACHED || !open_to_route(ni))
             {
                 continue;
             }
@@ -1254,125 +1362,31 @@ static boolean opener_spot(mobj_t *probe, line_t *ld, fixed_t *ox, fixed_t *oy)
     return false;
 }
 
-/* Build the field once, with `allow_damage` as it stands. False when there is
- * no field to be had; *no_seed says the reason was that no standing spot at
- * the exit could be reached, which is the one failure worth retrying. */
-static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
+/* Choose what the route leads to and flood the field from it.
+ *
+ * Split from building the grid because the two change on completely different
+ * clocks. The grid is geometry and changes when the level does; WHERE the
+ * route leads changes every time the player sees another room, which under
+ * fair play is every few decisions. Flooding is a pass over an array and the
+ * grid is thousands of engine queries, so re-asking the cheap question
+ * cheaply is the difference between an honest route and an unaffordable one.
+ */
+static boolean seed_and_flood(mobj_t *probe, boolean allow_keys, int *queue,
+                              api_point_t *spots, int n_spots, int build_ms,
+                              boolean *no_seed)
 {
-    fixed_t minx = 0, miny = 0, maxx = 0, maxy = 0;
-    api_point_t spots[API_MAX_EXIT_SPOTS];
-    int n_spots;
     int i, cx, cy, seed;
-    int build_ms;
-    int *queue;
     unsigned short *reach;
 
-    *no_seed = false;
-    free(field);
-    field = NULL;
-    held_keys = keys_of(probe);
     keys_wanted = 0;
     route_goal_key = 0;
     route_goal_switch = false;
-    wanted_count = 0;
-
-    n_spots = API_ExitSpots(probe, spots, API_MAX_EXIT_SPOTS);
-    if (numvertexes <= 0 || n_spots == 0)
-    {
-        printf("API_Route: no exit line, or nowhere to stand at it\n");
-        return false;
-    }
-    minx = maxx = vertexes[0].x;
-    miny = maxy = vertexes[0].y;
-    for (i = 1; i < numvertexes; i++)
-    {
-        if (vertexes[i].x < minx) minx = vertexes[i].x;
-        if (vertexes[i].x > maxx) maxx = vertexes[i].x;
-        if (vertexes[i].y < miny) miny = vertexes[i].y;
-        if (vertexes[i].y > maxy) maxy = vertexes[i].y;
-    }
-    grid_x0 = minx - ROUTE_CELL * FRACUNIT;
-    grid_y0 = miny - ROUTE_CELL * FRACUNIT;
-    grid_w = (maxx - minx) / FRACUNIT / ROUTE_CELL + 3;
-    grid_h = (maxy - miny) / FRACUNIT / ROUTE_CELL + 3;
-    if (grid_w <= 0 || grid_h <= 0 || grid_w * grid_h > ROUTE_MAX_CELLS)
-    {
-        printf("API_Route: %dx%d grid is too large for this level\n", grid_w, grid_h);
-        return false;
-    }
-
-    field = malloc(sizeof(unsigned short) * grid_w * grid_h);
-    queue = malloc(sizeof(int) * grid_w * grid_h);
-    if (field == NULL || queue == NULL)
-    {
-        printf("API_Route: out of memory for a %dx%d grid\n", grid_w, grid_h);
-        free(queue);
-        free(field);
-        field = NULL;
-        return false;
-    }
-    free(walk);
-    free(edges);
-    free(visited);
-    walk = calloc(1, grid_w * grid_h);
-    edges = calloc(1, grid_w * grid_h);
-    visited = calloc(1, grid_w * grid_h);
-    if (walk == NULL || edges == NULL || visited == NULL)
-    {
-        printf("API_Route: out of memory for a %dx%d grid\n", grid_w, grid_h);
-        free(queue);
-        free(field);
-        field = NULL;
-        return false;
-    }
+    route_goal_frontier = false;
+    frontier_step = -1;
     for (i = 0; i < grid_w * grid_h; i++)
     {
         field[i] = ROUTE_UNREACHED;
-        walk[i] = walkable(probe, cell_x(i % grid_w), cell_y(i / grid_w)) ? 1 : 0;
     }
-    build_ms = I_GetTimeMS();
-    build_edges(probe);
-    build_ms = I_GetTimeMS() - build_ms;
-    /* Every step has to exist from both ends. A traverse between two points
-     * is not bit-for-bit the same run in reverse, so asking the question from
-     * each end and believing both answers produced 128 one-way steps on E1M1
-     * - and a breadth-first field over a graph like that has local minima, a
-     * cell one step further from the exit than its neighbour with no step to
-     * it. The descent stops dead and the agent is told there is no route at
-     * all. Both directions are written from one test now; this is what says
-     * so, and it costs one pass over the grid. */
-    {
-        int bad = 0, k2, d2;
-
-        for (k2 = 0; k2 < grid_w * grid_h; k2++)
-        {
-            for (d2 = 0; d2 < 8; d2++)
-            {
-                int nx2, ny2;
-
-                if (!(edges[k2] & (1 << d2)))
-                {
-                    continue;
-                }
-                nx2 = k2 % grid_w + ROUTE_DX[d2];
-                ny2 = k2 / grid_w + ROUTE_DY[d2];
-                if (nx2 < 0 || ny2 < 0 || nx2 >= grid_w || ny2 >= grid_h
-                    || !(edges[ny2 * grid_w + nx2] & (1 << ROUTE_OPPOSITE[d2])))
-                {
-                    bad++;
-                }
-            }
-        }
-        if (bad > 0)
-        {
-            printf("API_Route: %d steps exist one way and not the other - the field "
-                   "will have dead ends in it\n", bad);
-        }
-    }
-    printf("API_Route: %d straight steps and %d diagonal ones; %d dropped by a wall, "
-           "%d for no room for a body, %d for want of a key\n",
-           kept_straight, kept_diagonal, dropped_wall, dropped_body, dropped_locked);
-
     /* WHICH walkable cells the player can actually get to.
      *
      * Needed because "walkable" and "reachable" are different questions, and
@@ -1525,6 +1539,66 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
         free(island);
     }
 
+    /* Nowhere known to head for: go and look.
+     *
+     * The frontier is the edge of what the player has seen - a cell they can
+     * walk to with a neighbour they have not laid eyes on - and walking to it
+     * is the whole of exploring. This is what replaces being handed the exit
+     * on a level nobody has walked: the route answers "where is there still
+     * something to find", which is a question a player can answer too, and
+     * the exit becomes the goal the moment it has been seen.
+     *
+     * The nearest one, measured over ground the player has seen rather than
+     * as the crow flies, because the crow flies through walls. */
+    if (seed < 0 && fair_play)
+    {
+        int best = -1, best_d = 0, k;
+
+        for (k = 0; k < grid_w * grid_h; k++)
+        {
+            int d;
+
+            if (reachable[k] == ROUTE_UNREACHED)
+            {
+                continue;
+            }
+            for (d = 0; d < 8; d++)
+            {
+                int nx = k % grid_w + ROUTE_DX[d];
+                int ny = k / grid_w + ROUTE_DY[d];
+                int ni;
+
+                if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+                {
+                    continue;
+                }
+                ni = ny * grid_w + nx;
+                /* A STEP into somewhere unseen, not merely a neighbour that
+                 * happens to be unseen. Without the edge test the cell on the
+                 * far side of a thin wall qualifies for ever: it is walkable,
+                 * it is unseen, and no amount of standing next to it changes
+                 * either - which is a player facing a wall waiting for it to
+                 * become interesting. */
+                if (!(edges[k] & (1 << d)) || (seen != NULL && seen[ni]))
+                {
+                    continue;
+                }
+                if (best < 0 || reachable[k] < best_d)
+                {
+                    best = k;
+                    best_d = reachable[k];
+                    frontier_step = ni;
+                }
+                break;
+            }
+        }
+        if (best >= 0)
+        {
+            seed = best;
+            route_goal_frontier = true;
+        }
+    }
+
     if (seed < 0)
     {
         int walkable_cells = 0, reached = 0;
@@ -1588,20 +1662,183 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
 
         static const char *colour_name[] = { "", "blue", "yellow", "red" };
 
+        if (build_ms > 0)
+        {
         printf("API_Route: %dx%d cells at %d units, %d reachable, %s %d cells from the "
                "spawn%s, %d ms to map the steps between them\n",
                grid_w, grid_h, ROUTE_CELL, got,
                route_goal_key ? colour_name[route_goal_key] : "exit",
                at_spawn == ROUTE_UNREACHED ? -1 : at_spawn,
                allow_damage ? " (through damaging floor)" : "", build_ms);
+        }
     }
 
     free(queue);
     return true;
 }
 
+/* Build the field once, with `allow_damage` as it stands. False when there is
+ * no field to be had; *no_seed says the reason was that no standing spot at
+ * the exit could be reached, which is the one failure worth retrying. */
+static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
+{
+    fixed_t minx = 0, miny = 0, maxx = 0, maxy = 0;
+    api_point_t spots[API_MAX_EXIT_SPOTS];
+    int n_spots;
+    int i, cx, cy, seed;
+    int build_ms;
+    int *queue;
+    unsigned short *reach;
+
+    *no_seed = false;
+    free(field);
+    field = NULL;
+    held_keys = keys_of(probe);
+    keys_wanted = 0;
+    route_goal_key = 0;
+    route_goal_switch = false;
+    route_goal_frontier = false;
+    frontier_step = -1;
+    wanted_count = 0;
+
+    n_spots = API_ExitSpots(probe, spots, API_MAX_EXIT_SPOTS);
+    if (numvertexes <= 0 || n_spots == 0)
+    {
+        printf("API_Route: no exit line, or nowhere to stand at it\n");
+        return false;
+    }
+    minx = maxx = vertexes[0].x;
+    miny = maxy = vertexes[0].y;
+    for (i = 1; i < numvertexes; i++)
+    {
+        if (vertexes[i].x < minx) minx = vertexes[i].x;
+        if (vertexes[i].x > maxx) maxx = vertexes[i].x;
+        if (vertexes[i].y < miny) miny = vertexes[i].y;
+        if (vertexes[i].y > maxy) maxy = vertexes[i].y;
+    }
+    grid_x0 = minx - ROUTE_CELL * FRACUNIT;
+    grid_y0 = miny - ROUTE_CELL * FRACUNIT;
+    grid_w = (maxx - minx) / FRACUNIT / ROUTE_CELL + 3;
+    grid_h = (maxy - miny) / FRACUNIT / ROUTE_CELL + 3;
+    if (grid_w <= 0 || grid_h <= 0 || grid_w * grid_h > ROUTE_MAX_CELLS)
+    {
+        printf("API_Route: %dx%d grid is too large for this level\n", grid_w, grid_h);
+        return false;
+    }
+
+    field = malloc(sizeof(unsigned short) * grid_w * grid_h);
+    queue = malloc(sizeof(int) * grid_w * grid_h);
+    if (field == NULL || queue == NULL)
+    {
+        printf("API_Route: out of memory for a %dx%d grid\n", grid_w, grid_h);
+        free(queue);
+        free(field);
+        field = NULL;
+        return false;
+    }
+    free(walk);
+    free(edges);
+    free(visited);
+    free(seen);
+    free(cell_sector);
+    walk = calloc(1, grid_w * grid_h);
+    edges = calloc(1, grid_w * grid_h);
+    visited = calloc(1, grid_w * grid_h);
+    seen = calloc(1, grid_w * grid_h);
+    cell_sector = malloc(sizeof(int) * grid_w * grid_h);
+    if (walk == NULL || edges == NULL || visited == NULL || seen == NULL
+        || cell_sector == NULL)
+    {
+        printf("API_Route: out of memory for a %dx%d grid\n", grid_w, grid_h);
+        free(queue);
+        free(field);
+        field = NULL;
+        return false;
+    }
+    for (i = 0; i < grid_w * grid_h; i++)
+    {
+        subsector_t *ss;
+
+        field[i] = ROUTE_UNREACHED;
+        walk[i] = walkable(probe, cell_x(i % grid_w), cell_y(i / grid_w)) ? 1 : 0;
+        /* Which sector each cell is in, looked up once. What the player has
+         * SEEN changes every few decisions and is decided from this. */
+        ss = R_PointInSubsector(cell_x(i % grid_w), cell_y(i / grid_w));
+        cell_sector[i] = ss != NULL && ss->sector != NULL ? ss->sector - sectors : -1;
+    }
+    mark_seen(probe);
+    build_ms = I_GetTimeMS();
+    build_edges(probe);
+    build_ms = I_GetTimeMS() - build_ms;
+    /* Every step has to exist from both ends. A traverse between two points
+     * is not bit-for-bit the same run in reverse, so asking the question from
+     * each end and believing both answers produced 128 one-way steps on E1M1
+     * - and a breadth-first field over a graph like that has local minima, a
+     * cell one step further from the exit than its neighbour with no step to
+     * it. The descent stops dead and the agent is told there is no route at
+     * all. Both directions are written from one test now; this is what says
+     * so, and it costs one pass over the grid. */
+    {
+        int bad = 0, k2, d2;
+
+        for (k2 = 0; k2 < grid_w * grid_h; k2++)
+        {
+            for (d2 = 0; d2 < 8; d2++)
+            {
+                int nx2, ny2;
+
+                if (!(edges[k2] & (1 << d2)))
+                {
+                    continue;
+                }
+                nx2 = k2 % grid_w + ROUTE_DX[d2];
+                ny2 = k2 / grid_w + ROUTE_DY[d2];
+                if (nx2 < 0 || ny2 < 0 || nx2 >= grid_w || ny2 >= grid_h
+                    || !(edges[ny2 * grid_w + nx2] & (1 << ROUTE_OPPOSITE[d2])))
+                {
+                    bad++;
+                }
+            }
+        }
+        if (bad > 0)
+        {
+            printf("API_Route: %d steps exist one way and not the other - the field "
+                   "will have dead ends in it\n", bad);
+        }
+    }
+    printf("API_Route: %d straight steps and %d diagonal ones; %d dropped by a wall, "
+           "%d for no room for a body, %d for want of a key\n",
+           kept_straight, kept_diagonal, dropped_wall, dropped_body, dropped_locked);
+
+    return seed_and_flood(probe, allow_keys, queue, spots, n_spots, build_ms, no_seed);
+
+}
+
 /* Rebuild when the level changed. Keyed on the `lines` array, which a level
  * reload reallocates - a stale field would route through a map that is gone. */
+/* Re-decide where the route leads, because the player has seen more of the
+ * level. Cheap on purpose - see `seed_and_flood`. */
+static void reflood(mobj_t *probe)
+{
+    api_point_t spots[API_MAX_EXIT_SPOTS];
+    int *queue;
+    int n_spots;
+    boolean no_seed;
+
+    if (field == NULL || grid_w <= 0)
+    {
+        return;
+    }
+    queue = malloc(sizeof(int) * grid_w * grid_h);
+    if (queue == NULL)
+    {
+        return;
+    }
+    n_spots = API_ExitSpots(probe, spots, API_MAX_EXIT_SPOTS);
+    mark_seen(probe);
+    seed_and_flood(probe, true, queue, spots, n_spots, 0, &no_seed);
+}
+
 /* Whether a shut sector the route was waiting on has since been opened.
  *
  * The grid describes the level as it was when it was built, and a switch is
@@ -1648,6 +1885,13 @@ static void ensure_built(mobj_t *probe)
     if (field != NULL && !field_stale && built_keys == keys_of(probe)
         && !wanted_sector_opened())
     {
+        /* The grid is current. What the player has SEEN may not be - it grows
+         * every time they look at a wall they have not looked at before - and
+         * that changes where the route leads without changing the level. */
+        if (fair_play && mapped_lines() != seen_from)
+        {
+            reflood(probe);
+        }
         return;
     }
     field_stale = false;
@@ -2079,6 +2323,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
         out->have_switch = false;
         out->goal_key = route_goal_key;
         out->goal_switch = route_goal_switch;
+        out->goal_frontier = route_goal_frontier;
     out->goal_switch = route_goal_switch;
         out->x = cell_x(best % grid_w);
         out->y = cell_y(best / grid_w);
@@ -2093,6 +2338,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
     out->have_switch = false;
     out->goal_key = route_goal_key;
     out->goal_switch = route_goal_switch;
+    out->goal_frontier = route_goal_frontier;
     if (field[at] == 0)
     {
         /* Standing at the goal. When the goal is a switch that is not the end
@@ -2101,6 +2347,32 @@ boolean API_Route(mobj_t *player, api_route_t *out)
          * wanders off - measured on E1M2, which reached its switch at
          * decision 162 and spent the next twelve hundred decisions elsewhere.
          * A key needs no such thing, because walking onto one picks it up. */
+        /* Standing on the frontier is not arriving anywhere: the job was to
+         * see what is past it, and that needs one more step. */
+        if (route_goal_frontier && frontier_step >= 0)
+        {
+            out->have_step = true;
+            out->x = cell_x(frontier_step % grid_w);
+            out->y = cell_y(frontier_step / grid_w);
+            /* And that step is very often through a door: the far side of one
+             * is unseen by definition until it is opened, so the edge of the
+             * explored world and the doors of a level are largely the same
+             * set of places. */
+            if (!can_walk_to(player, out->x, out->y) && walk_block_line != NULL)
+            {
+                line_t *ld = walk_block_line;
+
+                out->blocked = true;
+                out->can_open = ld->special != 0;
+                out->block_x = player->x
+                               + FixedMul(out->x - player->x, walk_block_frac);
+                out->block_y = player->y
+                               + FixedMul(out->y - player->y, walk_block_frac);
+                note_opener(player, ld, out);
+            }
+            note_shut_door(player, out);
+            return true;
+        }
         if (route_goal_switch)
         {
             out->blocked = true;
@@ -2578,6 +2850,20 @@ cJSON *API_RouteDebug(mobj_t *player)
         cJSON_AddNumberToObject(root, "aimY", r.y >> FRACBITS);
     }
     return root;
+}
+
+void API_RouteFairPlay(boolean on)
+{
+    if (fair_play != on)
+    {
+        fair_play = on;
+        field_stale = true;
+    }
+}
+
+boolean API_RouteIsFair(void)
+{
+    return fair_play;
 }
 
 void API_RouteForgetVisited(void)
