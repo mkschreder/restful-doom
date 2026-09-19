@@ -312,16 +312,28 @@ int API_ExitSpots(mobj_t *probe, api_point_t *out, int max)
     static const int offsets[] = { 32, 56, 80, 112, 144, 192 };
     static const int alongs[] = { 2, 1, 3 };
     int i, n = 0;
+    /* The normal exit first, and the secret one only if the level has no
+     * other. They are different objectives: a secret exit ends the level
+     * somewhere else entirely, and the level is not built to lead you to it -
+     * it is built to hide it. E1M3 has both, the secret one at a lower line
+     * number, and taking the first match sent every route to it: across a
+     * hellslime pit the player has no business in, with the blue key the
+     * NORMAL exit needs never asked for, and the scripted player dead in the
+     * slime at decision 58. */
+    boolean secret;
 
+    for (secret = false; secret <= true && n == 0; secret++)
+    {
     for (i = 0; i < numlines && n < max; i++)
     {
         line_t *ld = &lines[i];
         fixed_t dx, dy, len;
         unsigned int oi, ai;
         int side;
+        boolean is_exit = ld->special == 11 || ld->special == 52;
+        boolean is_secret = ld->special == 51 || ld->special == 124;
 
-        if (ld->special != 11 && ld->special != 51 && ld->special != 52
-            && ld->special != 124)
+        if (secret ? !is_secret : !is_exit)
         {
             continue;
         }
@@ -356,6 +368,7 @@ int API_ExitSpots(mobj_t *probe, api_point_t *out, int max)
                 }
             }
         }
+    }
     }
     return n;
 }
