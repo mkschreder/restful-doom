@@ -1547,6 +1547,52 @@ boolean API_Route(mobj_t *player, api_route_t *out)
                 out->block_x = player->x + FixedMul(tx - player->x, walk_block_frac);
                 out->block_y = player->y + FixedMul(ty - player->y, walk_block_frac);
             }
+            /* A diagonal the player cannot walk straight at is still a
+             * corner they can round: go via one of its two legs.
+             *
+             * The grid admits a diagonal step when an L-path of real edges
+             * exists OR the point between the two cells is floor, and in both
+             * cases the two orthogonal cells either side of it are where a
+             * player standing anywhere but the exact middle of a cell has to
+             * pass. Aiming at the far corner instead puts the bearing into the
+             * wall between them, and the follower presses at it: measured on
+             * E1M2, three cells for six hundred decisions, twelve hundred
+             * units short of the exit, with the whole rest of the route
+             * correct behind it. */
+            {
+                int fx = first % grid_w, fy = first / grid_w;
+
+                if (fx != cx && fy != cy)
+                {
+                    int legs[2];
+                    int i, pick = -1;
+
+                    legs[0] = fy * grid_w + cx;
+                    legs[1] = cy * grid_w + fx;
+                    for (i = 0; i < 2; i++)
+                    {
+                        int lx = legs[i] % grid_w, ly = legs[i] / grid_w;
+
+                        if (!walk[legs[i]]
+                            || !can_walk_to(player, cell_x(lx), cell_y(ly)))
+                        {
+                            continue;
+                        }
+                        if (pick < 0 || field[legs[i]] < field[pick])
+                        {
+                            pick = legs[i];
+                        }
+                    }
+                    if (pick >= 0)
+                    {
+                        out->have_step = true;
+                        out->x = cell_x(pick % grid_w);
+                        out->y = cell_y(pick / grid_w);
+                        return true;
+                    }
+                }
+            }
+
             /* The descent walks one chain of cells and gives up the moment
              * the next link is not straight ahead. That is too literal: the
              * player is standing somewhere in a cell rather than on its middle,
