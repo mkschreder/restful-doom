@@ -17,6 +17,10 @@
  * translation unit that included api.h emitted its own, and the linker
  * silently merged them. */
 extern int keys_down[NUMKEYS];
+
+/* Drop every held key and any turn still in progress. Called when an episode
+ * restarts, so the new one does not inherit the last decision of the old. */
+void API_ReleaseControls(void);
 extern int target_angle;
 
 void API_Init(int port);

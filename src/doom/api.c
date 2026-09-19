@@ -749,6 +749,38 @@ void turnPlayer()
     }
 }
 
+/* Let go of everything the player was doing.
+ *
+ * A key held for a countdown of tics and a turn still closing on its target
+ * both outlive the episode that asked for them, and the first tic of the NEXT
+ * episode then replays the tail of the last decision of the previous one. It
+ * is one unit of movement and one degree of turn, and it is enough: the
+ * levels are deterministic, so from the second episode onward every run is a
+ * different run. Measured on E1M1, which finishes from its own spawn as the
+ * first episode of a process and, as the second, walks into a doorway it
+ * wedges in and stands there for the rest of the run - eleven times out of
+ * twelve, identically, which is what a determinism bug looks like from
+ * outside. */
+void API_ReleaseControls(void)
+{
+    int i;
+
+    for (i = 0; i < NUMKEYS; i++)
+    {
+        if (keys_down[i] > 0)
+        {
+            event_t event;
+
+            event.type = ev_keyup;
+            event.data1 = i;
+            event.data2 = 0;
+            D_PostEvent(&event);
+        }
+        keys_down[i] = -1;
+    }
+    target_angle = -1;
+}
+
 void API_AfterTic()
 {
     for (int i = 0; i < NUMKEYS; i++) {

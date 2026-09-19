@@ -1171,6 +1171,9 @@ api_response_t API_PostEpisode(cJSON *req)
         have_pending_seed = true;
     }
 
+    /* Nothing of the last episode's last decision carries into this one. */
+    API_ReleaseControls();
+
     G_DeferedInitNew((skill_t)skill, episode, map);
 
     // The engine acts on that at the top of the next tic, and the level is not
