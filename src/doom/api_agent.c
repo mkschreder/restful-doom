@@ -418,8 +418,34 @@ static cJSON *DescribeAgentPlayer(void)
     {
         int sp = mo->subsector->sector->special;
 
-        cJSON_AddBoolToObject(o, "standingInDamage",
-                              sp == 4 || sp == 5 || sp == 7 || sp == 16 || sp == 11);
+        boolean burning = sp == 4 || sp == 5 || sp == 7 || sp == 16 || sp == 11;
+
+        cJSON_AddBoolToObject(o, "standingInDamage", burning);
+        // And which way the edge of it is. A player standing in nukage can
+        // SEE where it ends; an agent told only that the floor is burning
+        // cannot, and the route is no help because it is pointed at wherever
+        // the run is going, which is often across more of the same.
+        if (burning)
+        {
+            api_route_t dry;
+
+            if (API_DryLand(mo, &dry) && dry.have_step)
+            {
+                angle_t da = R_PointToAngle2(mo->x, mo->y, dry.x, dry.y);
+                int drel = angleToDegrees(da - mo->angle);
+                cJSON *g = cJSON_CreateObject();
+
+                if (drel > 180)
+                {
+                    drel -= 360;
+                }
+                cJSON_AddNumberToObject(g, "bearing", drel);
+                cJSON_AddNumberToObject(
+                    g, "distance",
+                    (int)API_FixedToFloat(P_AproxDistance(mo->x - dry.x, mo->y - dry.y)));
+                cJSON_AddItemToObject(o, "dryLand", g);
+            }
+        }
     }
     cJSON_AddNumberToObject(o, "health", p->health);
     cJSON_AddNumberToObject(o, "armor", p->armorpoints);

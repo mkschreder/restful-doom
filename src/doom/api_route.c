@@ -595,9 +595,19 @@ static void mark_seen(mobj_t *probe)
         {
             sector_seen[lines[i].frontsector - sectors] = 1;
         }
+        /* The far side only if there is a gap to see through it. Looking at
+         * a shut door does not show you the room behind it, and marking it
+         * seen anyway spread the explored region through every door in the
+         * level in a few dozen decisions - after which there was no frontier
+         * anywhere, no goal of any kind, and the agent span on the spot with
+         * four fifths of the level still unwalked. */
         if (lines[i].backsector != NULL)
         {
-            sector_seen[lines[i].backsector - sectors] = 1;
+            P_LineOpening(&lines[i]);
+            if (openrange > 0)
+            {
+                sector_seen[lines[i].backsector - sectors] = 1;
+            }
         }
     }
     /* And the room the player is standing in, whatever the automap says. A
@@ -611,6 +621,20 @@ static void mark_seen(mobj_t *probe)
     for (i = 0; i < grid_w * grid_h; i++)
     {
         seen[i] = cell_sector[i] >= 0 && sector_seen[cell_sector[i]];
+    }
+    /* And the cell the player is standing in, whichever sector its CENTRE
+     * happens to fall in. Near a boundary those are different sectors, and
+     * when the neighbour is one nobody has seen the player's own cell came
+     * out unseen - so the flood started nowhere, there was no route at all,
+     * and the agent span on the spot for the rest of the episode. */
+    if (probe != NULL)
+    {
+        int px, py;
+
+        if (cell_of(probe->x, probe->y, &px, &py))
+        {
+            seen[py * grid_w + px] = 1;
+        }
     }
     free(sector_seen);
 }
@@ -1609,6 +1633,21 @@ static boolean seed_and_flood(mobj_t *probe, boolean allow_keys, int *queue,
             walkable_cells += walk[i] != 0;
             reached += reachable[i] != ROUTE_UNREACHED;
         }
+        /* A handful of cells is not a level, it is the tic one loaded on.
+         * Nothing can be concluded from it - and what was concluded was "no
+         * dry way to the exit", after which the route waded for the whole of
+         * the rest of the run and the player died in the nukage it waded
+         * into. Under fair play the reachable region starts at the size of
+         * one room and grows, so this says "ask again", not "give up". */
+        if (reached < 8)
+        {
+            printf("API_Route: the level is not ready to be mapped yet\n");
+            *no_seed = false;
+            free(queue);
+            free(field);
+            field = NULL;
+            return false;
+        }
         printf("API_Route: none of the %d standing spots at the exit is in the %d cells "
                "the player can reach, of %d walkable%s\n",
                n_spots, reached, walkable_cells,
@@ -1668,7 +1707,9 @@ static boolean seed_and_flood(mobj_t *probe, boolean allow_keys, int *queue,
         printf("API_Route: %dx%d cells at %d units, %d reachable, %s %d cells from the "
                "spawn%s, %d ms to map the steps between them\n",
                grid_w, grid_h, ROUTE_CELL, got,
-               route_goal_key ? colour_name[route_goal_key] : "exit",
+               route_goal_frontier ? "the frontier"
+                   : route_goal_switch ? "a switch"
+                   : route_goal_key ? colour_name[route_goal_key] : "exit",
                at_spawn == ROUTE_UNREACHED ? -1 : at_spawn,
                allow_damage ? " (through damaging floor)" : "", build_ms);
         }
@@ -1766,6 +1807,17 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
          * SEEN changes every few decisions and is decided from this. */
         ss = R_PointInSubsector(cell_x(i % grid_w), cell_y(i / grid_w));
         cell_sector[i] = ss != NULL && ss->sector != NULL ? ss->sector - sectors : -1;
+    }
+    /* The player is standing here, so this cell is one they can be in -
+     * whatever the test at its CENTRE says. A centre can fall inside a wall
+     * the player is standing beside, or in nukage while the route is trying
+     * to stay dry, and then the flood starts nowhere and reports that not one
+     * of the level's cells is reachable. Measured on E1M3: nineteen builds in
+     * four hundred decisions each reporting "0 cells the player can reach",
+     * after which the route gave up on staying dry and waded until it died. */
+    if (cell_of(probe->x, probe->y, &cx, &cy))
+    {
+        walk[cy * grid_w + cx] = 1;
     }
     mark_seen(probe);
     build_ms = I_GetTimeMS();
@@ -2998,6 +3050,97 @@ void API_RouteMarkVisited(mobj_t *player)
  * unexplored space beyond it. Here already-walked ground costs the same as
  * any other, and only the DESTINATION has to be new.
  */
+/* The way to the nearest floor that is not burning the player.
+ *
+ * A player standing in nukage can see where it ends; an agent given only "the
+ * floor here is burning you" cannot, and the route is no help because it is
+ * pointed at wherever the run is going, which on E1M3 is across more nukage.
+ * Measured: the scripted player shuffled inside a pool for seventy decisions
+ * and died in it with dry ground eighty units away.
+ *
+ * Breadth-first over the grid from where the player stands, crossing anything
+ * they fit in, stopping at the first cell whose floor does not hurt. */
+boolean API_DryLand(mobj_t *player, api_route_t *out)
+{
+    int cx, cy, head = 0, tail = 0, found = -1;
+    int *queue, *parent;
+    int i;
+
+    if (player == NULL || cell_sector == NULL || walk == NULL
+        || !cell_of(player->x, player->y, &cx, &cy))
+    {
+        return false;
+    }
+    queue = malloc(sizeof(int) * grid_w * grid_h);
+    parent = malloc(sizeof(int) * grid_w * grid_h);
+    if (queue == NULL || parent == NULL)
+    {
+        free(queue);
+        free(parent);
+        return false;
+    }
+    for (i = 0; i < grid_w * grid_h; i++)
+    {
+        parent[i] = -2;
+    }
+    parent[cy * grid_w + cx] = -1;
+    queue[tail++] = cy * grid_w + cx;
+    while (head < tail && found < 0)
+    {
+        int at = queue[head++];
+        int d;
+
+        for (d = 0; d < 8; d++)
+        {
+            int nx = at % grid_w + ROUTE_DX[d];
+            int ny = at / grid_w + ROUTE_DY[d];
+            int ni;
+
+            if (!(edges[at] & (1 << d)) || nx < 0 || ny < 0
+                || nx >= grid_w || ny >= grid_h)
+            {
+                continue;
+            }
+            ni = ny * grid_w + nx;
+            if (parent[ni] != -2)
+            {
+                continue;
+            }
+            parent[ni] = at;
+            if (cell_sector[ni] >= 0 && !hurts(sectors[cell_sector[ni]].special))
+            {
+                found = ni;
+                break;
+            }
+            queue[tail++] = ni;
+        }
+    }
+    if (found < 0)
+    {
+        free(queue);
+        free(parent);
+        return false;
+    }
+    /* Walk back to the step out of the cell the player is in: the direction
+     * to set off, not the far end of it. */
+    {
+        int at = found, steps = 0;
+
+        while (parent[at] >= 0)
+        {
+            at = parent[at];
+            steps++;
+        }
+        out->cells = steps;
+        out->have_step = true;
+        out->x = cell_x(found % grid_w);
+        out->y = cell_y(found / grid_w);
+    }
+    free(queue);
+    free(parent);
+    return true;
+}
+
 boolean API_Frontier(mobj_t *player, api_route_t *out)
 {
     int cx, cy, head = 0, tail = 0, found = -1;

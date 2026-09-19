@@ -111,6 +111,11 @@ boolean API_RouteCellOf(fixed_t x, fixed_t y, int *cx, int *cy);
  * that starts an episode a stated distance from its goal. */
 boolean API_RouteSpotAt(int units, unsigned int seed, fixed_t *x, fixed_t *y);
 
+/* The nearest floor that is not hurting the player, and the way to it. False
+ * when there is none to be found - which for a player standing in nukage is
+ * the difference between a way out and a death. */
+boolean API_DryLand(mobj_t *player, api_route_t *out);
+
 /* The nearest place the player has NOT been, and the way to it. False when
  * every reachable place has been walked. */
 boolean API_Frontier(mobj_t *player, api_route_t *out);
