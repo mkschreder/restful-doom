@@ -94,30 +94,46 @@ static int keys_wanted;
  * switch-operated doors are these, and they are as much a part of the way
  * through as a keycard is. */
 #define ROUTE_MAX_WANTED 16
-static sector_t *wanted_sectors[ROUTE_MAX_WANTED];
+static line_t *wanted_lines[ROUTE_MAX_WANTED];
 static int wanted_count;
 static boolean route_goal_switch;
+/* Set when the level has changed under the field and it must be rebuilt. */
+static boolean field_stale;
 /* The switch the route is leading to, when it is leading to one. */
 static fixed_t route_switch_x, route_switch_y;
 
-static void want_sector(sector_t *sec)
+/* The tagged sector either side of a line that something else opens. */
+static sector_t *shut_sector_of(line_t *ld)
+{
+    if (ld->backsector != NULL && ld->backsector->tag != 0)
+    {
+        return ld->backsector;
+    }
+    if (ld->frontsector != NULL && ld->frontsector->tag != 0)
+    {
+        return ld->frontsector;
+    }
+    return NULL;
+}
+
+static void want_line(line_t *ld)
 {
     int i;
 
-    if (sec == NULL || sec->tag == 0)
+    if (shut_sector_of(ld) == NULL)
     {
         return;
     }
     for (i = 0; i < wanted_count; i++)
     {
-        if (wanted_sectors[i] == sec)
+        if (wanted_lines[i] == ld)
         {
             return;
         }
     }
     if (wanted_count < ROUTE_MAX_WANTED)
     {
-        wanted_sectors[wanted_count++] = sec;
+        wanted_lines[wanted_count++] = ld;
     }
 }
 
@@ -197,8 +213,7 @@ static boolean line_passable(line_t *ld)
              * exactly the way a locked door is - the player has to go and do
              * something first - so it is treated the same way, and the sector
              * is remembered so the route can lead to its switch. */
-            want_sector(ld->backsector != NULL && ld->backsector->tag != 0
-                            ? ld->backsector : ld->frontsector);
+            want_line(ld);
             return false;
         }
     }
@@ -1367,15 +1382,30 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
      * the level. Seeding the distance field there produced a field covering
      * six cells out of 3268 walkable ones, and an agent that was told the exit
      * was unreachable from everywhere. */
-    if (!cell_of(probe->x, probe->y, &cx, &cy) || !walkable(probe, probe->x, probe->y))
+    /* Asked without the no-damage rule, whatever rule the rest of the build
+     * is using. The player IS standing here, so it is by definition somewhere
+     * they can be - and a player who has stepped into nukage is standing on
+     * floor that `walkable` refuses while the field is trying to stay dry.
+     * That read as "not on the grid", the build failed, the next attempt
+     * allowed damage and succeeded, and E1M1 then routed every remaining
+     * episode straight through its nukage room. */
     {
-        printf("API_Route: the player is not on the grid\n");
-        free(queue);
-        free(field);
-        field = NULL;
-        return false;
-    }
-    reach = malloc(sizeof(unsigned short) * grid_w * grid_h);
+        boolean dry = allow_damage;
+        boolean on_grid;
+
+        allow_damage = true;
+        on_grid = cell_of(probe->x, probe->y, &cx, &cy)
+                  && walkable(probe, probe->x, probe->y);
+        allow_damage = dry;
+        if (!on_grid)
+        {
+            printf("API_Route: the player is not on the grid\n");
+            free(queue);
+            free(field);
+            field = NULL;
+            return false;
+        }
+    }    reach = malloc(sizeof(unsigned short) * grid_w * grid_h);
     if (reach == NULL)
     {
         free(queue);
@@ -1464,7 +1494,8 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
         {
             int j;
 
-            if (island == NULL || exit_cell < 0 || !sector_joins(wanted_sectors[w], island))
+            if (island == NULL || exit_cell < 0
+                || !sector_joins(shut_sector_of(wanted_lines[w]), island))
             {
                 continue;
             }
@@ -1474,7 +1505,8 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
                 fixed_t sx, sy;
                 int scx, scy;
 
-                if (ld->special == 0 || ld->tag != wanted_sectors[w]->tag)
+                if (ld->special == 0
+                    || ld->tag != shut_sector_of(wanted_lines[w])->tag)
                 {
                     continue;
                 }
@@ -1583,9 +1615,15 @@ static boolean wanted_sector_opened(void)
 
     for (i = 0; i < wanted_count; i++)
     {
-        sector_t *sec = wanted_sectors[i];
-
-        if (sec->ceilingheight - sec->floorheight >= ROUTE_HEIGHT)
+        /* The OPENING that was refused, not the sector's own height. A sector
+         * can be head-high on its own and still have no gap at all against
+         * the one next to it - a raised platform is exactly that - so asking
+         * about the sector said "opened" from the moment it was recorded, and
+         * the whole grid was rebuilt on every observation. Measured on E1M1:
+         * 11 to 24 ms of engine time per decision, and nine of twelve
+         * episodes stalled in the same spot. */
+        P_LineOpening(wanted_lines[i]);
+        if (openrange >= ROUTE_HEIGHT)
         {
             return true;
         }
@@ -1597,16 +1635,22 @@ static void ensure_built(mobj_t *probe)
 {
     boolean no_seed;
 
-    if (field != NULL && built_for == (void *)lines && built_count == numlines
-        && built_keys == keys_of(probe) && !wanted_sector_opened())
+    if (built_for != (void *)lines || built_count != numlines)
+    {
+        /* A new level. Everything remembered about the last one points into
+         * memory that has been freed and reallocated - the wanted lines
+         * especially - so it goes before anything reads it, and the dry route
+         * is worth trying again. */
+        allow_damage = false;
+        wanted_count = 0;
+        field_stale = true;
+    }
+    if (field != NULL && !field_stale && built_keys == keys_of(probe)
+        && !wanted_sector_opened())
     {
         return;
     }
-    if (built_for != (void *)lines)
-    {
-        /* A new level: try the dry route again. */
-        allow_damage = false;
-    }
+    field_stale = false;
     /* Picking up a key changes which doors are walls, so it changes the map.
      * Rebuilding on that is what turns "go and get the blue key" into "now go
      * to the exit" without anything else having to notice. */
@@ -1649,6 +1693,17 @@ static void ensure_built(mobj_t *probe)
                     printf("API_Route: %s\n", why[try_]);
                 }
                 return;
+            }
+            if (!no_seed)
+            {
+                /* It failed for a reason a different question does not
+                 * answer - no level loaded, no exit line, the player nowhere
+                 * on the grid. Asking again with the slime allowed gets the
+                 * same answer, and TAKING it means routing through slime for
+                 * the rest of the run on the strength of an unrelated
+                 * failure, which is what E1M1 did from its fourth episode on.
+                 */
+                break;
             }
         }
     }
