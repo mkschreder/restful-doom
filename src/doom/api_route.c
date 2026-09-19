@@ -53,6 +53,9 @@
 /* How far to look for the route when the player is standing off it, in cells.
  * Six is about two of the player's own decisions of walking. */
 #define ROUTE_RECOVER 6
+/* The player's own height, and the tallest step they can walk up, matching
+ * P_TryMove's own rules. A crossing with less room than this is not one. */
+#define ROUTE_HEIGHT (56 * FRACUNIT)
 
 static unsigned short *field;
 /* Which cells the player can reach at all, and which edges between them a
@@ -106,12 +109,41 @@ static int lock_of(line_t *ld)
  * carrying. A shut door they CAN open is two-sided and is not blocked - they
  * open it - which is why the route runs through doors and the agent is told
  * about the one in front of it. */
+/* Whether anything in the level can ever move this line's opening.
+ *
+ * The distinction this draws is the one between a shut door and a wall, and
+ * both look identical from the geometry: a two-sided linedef with no gap
+ * between floor and ceiling. A door has a special on the line itself, or a
+ * tagged back sector that some switch or trigger elsewhere operates. A wall
+ * has neither - and DOOM is full of walls built that way, because a sector of
+ * zero height is how a mapper of 1993 draws a diagonal with its own texture. */
+static boolean line_can_open(line_t *ld)
+{
+    return ld->special != 0 || (ld->backsector != NULL && ld->backsector->tag != 0);
+}
+
 static boolean PTR_RouteTraverse(intercept_t *in)
 {
     line_t *ld = in->d.line;
     int lock;
 
     if (ld->backsector == NULL || ld->frontsector == NULL || (ld->flags & ML_BLOCKING))
+    {
+        route_blocked = true;
+        return false;
+    }
+    /* Two-sided and no way through. A SHUT DOOR looks exactly like this and
+     * must stay crossable - the whole field is built on a player opening the
+     * doors in front of them - so the test is not "is there room now" but "can
+     * there ever be".
+     *
+     * Without this the grid ran an edge straight through E1M2's diagonal
+     * walls, which are zero-height sectors rather than one-sided lines: the
+     * route crossed them, the player could not, and a follower oscillated
+     * across three cells for six hundred decisions with the bearing pointing
+     * into the wall twenty-five units ahead. */
+    P_LineOpening(ld);
+    if (openrange < ROUTE_HEIGHT && !line_can_open(ld))
     {
         route_blocked = true;
         return false;
