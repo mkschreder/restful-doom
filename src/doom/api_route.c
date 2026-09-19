@@ -93,6 +93,13 @@ static int keys_wanted;
 /* The colour of key a line demands, or 0. Both the doors a player opens by
  * walking into them and the ones a switch opens remotely; the numbers are
  * p_doors.c's own. */
+/* Steps refused because a locked door stood in them, this build. Counted
+ * because "the route crossed a door it has no key for" and "the route found
+ * another way round" are indistinguishable from the outside, and the first is
+ * a bug that reads as a working route right up until the player is standing
+ * at the door. */
+static int dropped_locked;
+
 static int lock_of(line_t *ld)
 {
     switch (ld->special)
@@ -122,19 +129,22 @@ static boolean line_can_open(line_t *ld)
     return ld->special != 0 || (ld->backsector != NULL && ld->backsector->tag != 0);
 }
 
-static boolean PTR_RouteTraverse(intercept_t *in)
+/* Whether the player could ever get through this line.
+ *
+ * A closed door counts as passable: the field is built on a player opening
+ * the doors in front of them. A locked one does not, until its key is held -
+ * and the colour is remembered, because a key the route needs is the level's
+ * own next objective. */
+static boolean line_passable(line_t *ld)
 {
-    line_t *ld = in->d.line;
     int lock;
 
     if (ld->backsector == NULL || ld->frontsector == NULL || (ld->flags & ML_BLOCKING))
     {
-        route_blocked = true;
         return false;
     }
     /* Two-sided and no way through. A SHUT DOOR looks exactly like this and
-     * must stay crossable - the whole field is built on a player opening the
-     * doors in front of them - so the test is not "is there room now" but "can
+     * must stay crossable, so the test is not "is there room now" but "can
      * there ever be".
      *
      * Without this the grid ran an edge straight through E1M2's diagonal
@@ -145,14 +155,13 @@ static boolean PTR_RouteTraverse(intercept_t *in)
     P_LineOpening(ld);
     if (openrange < ROUTE_HEIGHT && !line_can_open(ld))
     {
-        route_blocked = true;
         return false;
     }
     lock = lock_of(ld);
     if (lock != 0 && !(held_keys & (1 << lock)))
     {
-        route_blocked = true;
         keys_wanted |= 1 << lock;
+        dropped_locked++;
         return false;
     }
     return true;
@@ -257,11 +266,85 @@ static boolean walkable(mobj_t *probe, fixed_t x, fixed_t y)
     return ok;
 }
 
+/* The segment being tested, and whether anything in the way stopped it. */
+static divline_t cross_trace;
+static boolean cross_blocked;
+
+static boolean PIT_CrossLine(line_t *ld)
+{
+    divline_t dl;
+
+    /* Both ends of the line on the same side of the segment, or both ends of
+     * the segment on the same side of the line: they do not cross. */
+    if (P_PointOnDivlineSide(ld->v1->x, ld->v1->y, &cross_trace)
+        == P_PointOnDivlineSide(ld->v2->x, ld->v2->y, &cross_trace))
+    {
+        return true;
+    }
+    dl.x = ld->v1->x;
+    dl.y = ld->v1->y;
+    dl.dx = ld->v2->x - ld->v1->x;
+    dl.dy = ld->v2->y - ld->v1->y;
+    if (P_PointOnDivlineSide(cross_trace.x, cross_trace.y, &dl)
+        == P_PointOnDivlineSide(cross_trace.x + cross_trace.dx,
+                                cross_trace.y + cross_trace.dy, &dl))
+    {
+        return true;
+    }
+    if (!line_passable(ld))
+    {
+        cross_blocked = true;
+        return false;
+    }
+    return true;
+}
+
+/* Whether a player could walk the straight line between two points, as far as
+ * the LINES are concerned.
+ *
+ * Every line in the segment's bounding box, rather than P_PathTraverse along
+ * it. The engine's own traverse walks the blockmap with a DDA that steps in
+ * one axis at a time, and a trace running at exactly 45 degrees - which is
+ * every diagonal step on a square grid - can pass through a block corner and
+ * skip the block beyond it. Measured on E1M3: the step north out of cell
+ * (-1264,-2400) sees the blue door and is refused, and the step north-east
+ * out of the same cell, crossing the same door sixteen units along it, sees
+ * nothing at all. The route then ran through a locked door, never asked for
+ * the blue key, and the player stood at that door for thirteen hundred
+ * decisions. A box test cannot have that failure: it looks at every line that
+ * could possibly cross, and asks each one directly. */
 static boolean clear_line(fixed_t x1, fixed_t y1, fixed_t x2, fixed_t y2)
 {
-    route_blocked = false;
-    P_PathTraverse(x1, y1, x2, y2, PT_ADDLINES, PTR_RouteTraverse);
-    return !route_blocked;
+    int xl, xh, yl, yh, bx, by;
+    fixed_t lox = x1 < x2 ? x1 : x2;
+    fixed_t hix = x1 < x2 ? x2 : x1;
+    fixed_t loy = y1 < y2 ? y1 : y2;
+    fixed_t hiy = y1 < y2 ? y2 : y1;
+
+    cross_trace.x = x1;
+    cross_trace.y = y1;
+    cross_trace.dx = x2 - x1;
+    cross_trace.dy = y2 - y1;
+    cross_blocked = false;
+
+    xl = (lox - bmaporgx) >> MAPBLOCKSHIFT;
+    xh = (hix - bmaporgx) >> MAPBLOCKSHIFT;
+    yl = (loy - bmaporgy) >> MAPBLOCKSHIFT;
+    yh = (hiy - bmaporgy) >> MAPBLOCKSHIFT;
+    if (xl < 0) xl = 0;
+    if (yl < 0) yl = 0;
+    if (xh >= bmapwidth) xh = bmapwidth - 1;
+    if (yh >= bmapheight) yh = bmapheight - 1;
+
+    validcount++;
+    for (bx = xl; bx <= xh && !cross_blocked; bx++)
+    {
+        for (by = yl; by <= yh && !cross_blocked; by++)
+        {
+            P_BlockLinesIterator(bx, by, PIT_CrossLine);
+        }
+    }
+    return !cross_blocked;
 }
 
 /* Can a player get from one cell to its neighbour?
@@ -483,6 +566,8 @@ static int kept_straight, kept_diagonal, dropped_wall, dropped_body;
  * two legs in a wall at every step along it. */
 static void build_edges(mobj_t *probe)
 {
+    dropped_locked = 0;
+
     int k, d;
 
     kept_straight = kept_diagonal = dropped_wall = dropped_body = 0;
@@ -1122,8 +1207,8 @@ static boolean build_field(mobj_t *probe, boolean *no_seed)
         }
     }
     printf("API_Route: %d straight steps and %d diagonal ones; %d dropped by a wall, "
-           "%d for no room for a body\n",
-           kept_straight, kept_diagonal, dropped_wall, dropped_body);
+           "%d for no room for a body, %d for want of a key\n",
+           kept_straight, kept_diagonal, dropped_wall, dropped_body, dropped_locked);
 
     /* WHICH walkable cells the player can actually get to.
      *
