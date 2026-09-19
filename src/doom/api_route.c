@@ -1753,6 +1753,111 @@ boolean API_Route(mobj_t *player, api_route_t *out)
     return true;
 }
 
+/* Why the cell the player is standing in is not on the field.
+ *
+ * A cell can be walkable, have edges to its neighbours, and still be nowhere
+ * the distance field ever reached - the field floods from the exit over the
+ * grid as it was at level load, and the player is walking the level as it is
+ * NOW. A lift that has moved, a floor a switch raised, a door the grid was
+ * built with shut: each of them is a place the player can get to and the field
+ * cannot. From outside the engine every one of those looks the same, an agent
+ * standing somewhere the route has no opinion about, and it is the line
+ * specials in between that say which it is.
+ *
+ * So: cross the gap from the field to this cell, ignoring whether a player
+ * could walk it, and report what is on the way. The same question, and the
+ * same answer, that `report_boundary` prints at build time - asked here about
+ * wherever the player has got to. */
+static cJSON *explain_gap(int target)
+{
+    int *from = malloc(sizeof(int) * grid_w * grid_h);
+    int *queue = malloc(sizeof(int) * grid_w * grid_h);
+    int head = 0, tail = 0, k, steps = 0, at;
+    cJSON *out, *arr;
+
+    if (from == NULL || queue == NULL)
+    {
+        free(from);
+        free(queue);
+        return NULL;
+    }
+    for (k = 0; k < grid_w * grid_h; k++)
+    {
+        from[k] = -2;
+        if (field[k] != ROUTE_UNREACHED)
+        {
+            from[k] = -1;
+            queue[tail++] = k;
+        }
+    }
+    while (head < tail && from[target] == -2)
+    {
+        int d;
+
+        at = queue[head++];
+        for (d = 0; d < 4; d++)
+        {
+            int nx = (at % grid_w) + ROUTE_DX[d];
+            int ny = (at / grid_w) + ROUTE_DY[d];
+            int ni;
+
+            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
+            {
+                continue;
+            }
+            ni = ny * grid_w + nx;
+            if (from[ni] != -2)
+            {
+                continue;
+            }
+            from[ni] = at;
+            queue[tail++] = ni;
+            if (ni == target)
+            {
+                break;
+            }
+        }
+    }
+    if (from[target] == -2)
+    {
+        free(from);
+        free(queue);
+        return NULL;
+    }
+
+    boundary_count = 0;
+    at = target;
+    while (from[at] >= 0)
+    {
+        int prev = from[at];
+
+        P_PathTraverse(cell_x(at % grid_w), cell_y(at / grid_w),
+                       cell_x(prev % grid_w), cell_y(prev / grid_w),
+                       PT_ADDLINES, PTR_BoundaryTraverse);
+        at = prev;
+        steps++;
+    }
+    out = cJSON_CreateObject();
+    cJSON_AddNumberToObject(out, "cells", steps);
+    cJSON_AddNumberToObject(out, "units", steps * ROUTE_CELL);
+    cJSON_AddNumberToObject(out, "fieldX", cell_x(at % grid_w) >> FRACBITS);
+    cJSON_AddNumberToObject(out, "fieldY", cell_y(at / grid_w) >> FRACBITS);
+    arr = cJSON_CreateArray();
+    for (k = 0; k < boundary_count; k++)
+    {
+        const char *name = special_name(boundary_specials[k]);
+        cJSON *o = cJSON_CreateObject();
+
+        cJSON_AddNumberToObject(o, "special", boundary_specials[k]);
+        cJSON_AddStringToObject(o, "what", name != NULL ? name : "no special");
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_AddItemToObject(out, "lines", arr);
+    free(from);
+    free(queue);
+    return out;
+}
+
 cJSON *API_RouteDebug(mobj_t *player)
 {
     cJSON *root, *arr;
@@ -1804,6 +1909,76 @@ cJSON *API_RouteDebug(mobj_t *player)
         cJSON_AddItemToArray(arr, o);
     }
     cJSON_AddItemToObject(root, "steps", arr);
+
+    /* Standing somewhere the field never reached: say what is in between,
+     * because that is the whole question when a route stops answering. */
+    if (field[at] == ROUTE_UNREACHED)
+    {
+        cJSON *gap = explain_gap(at);
+
+        if (gap != NULL)
+        {
+            cJSON_AddItemToObject(root, "cutOffBy", gap);
+        }
+    }
+
+    /* Standing somewhere the field never reached: say what is in between,
+     * because that is the whole question when a route stops answering. */
+    if (field[at] == ROUTE_UNREACHED)
+    {
+        cJSON *gap = explain_gap(at);
+
+        if (gap != NULL)
+        {
+            cJSON_AddItemToObject(root, "cutOffBy", gap);
+        }
+    }
+
+    /* Where the field would take the player from here, following the same
+     * edges it was built over. It must descend to zero: a BFS field cannot do
+     * otherwise. Printing it is how a route that is RIGHT and a player that
+     * cannot follow it are told apart - compare this chain with the cells the
+     * player actually visited, and the step it never manages is the bug. */
+    arr = cJSON_CreateArray();
+    {
+        int here = at, n;
+
+        for (n = 0; n < 24 && field[here] != ROUTE_UNREACHED && field[here] > 0; n++)
+        {
+            int best = -1, hx = here % grid_w, hy = here / grid_w;
+            cJSON *o;
+
+            for (d = 0; d < 8; d++)
+            {
+                int nx = hx + ROUTE_DX[d];
+                int ny = hy + ROUTE_DY[d];
+                int ni = ny * grid_w + nx;
+
+                if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h
+                    || !(edges[here] & (1 << d)) || field[ni] == ROUTE_UNREACHED)
+                {
+                    continue;
+                }
+                if (best < 0 || field[ni] < field[best])
+                {
+                    best = ni;
+                }
+            }
+            if (best < 0 || field[best] >= field[here])
+            {
+                break;
+            }
+            o = cJSON_CreateObject();
+            cJSON_AddNumberToObject(o, "x", cell_x(best % grid_w) >> FRACBITS);
+            cJSON_AddNumberToObject(o, "y", cell_y(best / grid_w) >> FRACBITS);
+            cJSON_AddNumberToObject(o, "distance", field[best]);
+            cJSON_AddBoolToObject(o, "diagonal",
+                                  (best % grid_w) != hx && (best / grid_w) != hy);
+            cJSON_AddItemToArray(arr, o);
+            here = best;
+        }
+    }
+    cJSON_AddItemToObject(root, "descent", arr);
 
     if (API_Route(player, &r) && r.have_step)
     {
