@@ -654,46 +654,138 @@ static boolean PTR_ProbeTraverse(intercept_t *in)
     return true;
 }
 
-/* How far the player could walk this way before the floor starts hurting,
- * capped at the clearance in that direction.
+/* How far the player can SEE this way before something blocks the view.
  *
- * A player SEES nukage: it is a different floor, lit differently, and every
- * one of them learns within a minute of their first game that the green
- * sludge takes health off you. An agent told only "the floor you are standing
- * on is burning you" cannot learn that, because nothing in its observation
- * distinguishes a corridor from a corridor with a pool in it until it is
- * already standing in the pool. That is not a hard reinforcement-learning
- * problem, it is an unlearnable one: the feature the rule depends on is not
- * in the state.
- *
- * Sampled along the ray at half the player's width, and reported only out to
- * where the player could actually walk - you cannot see the floor through a
- * wall. */
-static int BurningFloorAhead(mobj_t *player, int bearing_deg, int clearance)
+ * Sight, not walking: you can see over a ledge you cannot step off and
+ * through a window you cannot climb, and the whole point of looking at the
+ * floor is to find out about ground you have not reached yet. A two-sided
+ * line with any opening at all is seen through; anything else stops the eye.
+ */
+static fixed_t sight_frac;
+
+static boolean PTR_SightTraverse(intercept_t *in)
 {
-    angle_t a = player->angle + degreesToAngle(bearing_deg);
+    line_t *ld = in->d.line;
+
+    if (!(ld->flags & ML_TWOSIDED))
+    {
+        sight_frac = in->frac;
+        return false;
+    }
+    P_LineOpening(ld);
+    if (openrange <= 0)
+    {
+        sight_frac = in->frac;
+        return false;
+    }
+    return true;
+}
+
+static int SightRange(mobj_t *player, angle_t a, int max_units)
+{
     fixed_t fx = finecosine[a >> ANGLETOFINESHIFT];
     fixed_t fy = finesine[a >> ANGLETOFINESHIFT];
-    int step;
+    fixed_t tx = player->x + FixedMul(max_units << FRACBITS, fx);
+    fixed_t ty = player->y + FixedMul(max_units << FRACBITS, fy);
 
-    for (step = 0; step <= clearance; step += 16)
+    sight_frac = FRACUNIT;
+    P_PathTraverse(player->x, player->y, tx, ty, PT_ADDLINES, PTR_SightTraverse);
+    return (int)(((long long)max_units * sight_frac) >> FRACBITS);
+}
+
+/* What burning floor the player can SEE, as patches across their view.
+ *
+ * A player does not work out that the floor ahead is nukage - they look at it.
+ * It is a different floor, lit differently, and everybody learns within a
+ * minute of their first game that the green sludge takes health off you. So
+ * this is a scan of the view rather than a probe down the six directions the
+ * player might walk: a fan of rays across DOOM's own 90-degree field, each
+ * stopping where the eye stops, sampling the floor along the way. Runs of
+ * neighbouring rays that hit it are one patch, reported the way it looks -
+ * roughly which way, roughly how wide, and how far to its near edge.
+ *
+ * Only what is in front. A player who strafes blindly into a pool beside them
+ * deserves it, and turning to look is already one of the things they can do.
+ */
+#define AGENT_FOV 45
+#define AGENT_FOV_STEP 5
+#define AGENT_FOV_RAYS (2 * AGENT_FOV / AGENT_FOV_STEP + 1)
+#define AGENT_SEE_FLOOR 512
+
+static boolean BurningAt(fixed_t x, fixed_t y)
+{
+    subsector_t *ss = R_PointInSubsector(x, y);
+    int sp;
+
+    if (ss == NULL || ss->sector == NULL)
     {
-        fixed_t px = player->x + FixedMul(step << FRACBITS, fx);
-        fixed_t py = player->y + FixedMul(step << FRACBITS, fy);
-        subsector_t *ss = R_PointInSubsector(px, py);
-        int sp;
+        return false;
+    }
+    sp = ss->sector->special;
+    return sp == 4 || sp == 5 || sp == 7 || sp == 16 || sp == 11;
+}
 
-        if (ss == NULL || ss->sector == NULL)
+static void DescribeBurningFloor(cJSON *root, mobj_t *player)
+{
+    int hit[AGENT_FOV_RAYS];
+    int i;
+    cJSON *arr = NULL;
+
+    for (i = 0; i < AGENT_FOV_RAYS; i++)
+    {
+        int bearing = -AGENT_FOV + i * AGENT_FOV_STEP;
+        angle_t a = player->angle + degreesToAngle(bearing);
+        fixed_t fx = finecosine[a >> ANGLETOFINESHIFT];
+        fixed_t fy = finesine[a >> ANGLETOFINESHIFT];
+        int range = SightRange(player, a, AGENT_SEE_FLOOR);
+        int step;
+
+        hit[i] = -1;
+        for (step = 0; step <= range; step += 16)
+        {
+            if (BurningAt(player->x + FixedMul(step << FRACBITS, fx),
+                          player->y + FixedMul(step << FRACBITS, fy)))
+            {
+                hit[i] = step;
+                break;
+            }
+        }
+    }
+
+    /* Runs of neighbouring rays are one patch. */
+    for (i = 0; i < AGENT_FOV_RAYS; i++)
+    {
+        int j, near;
+        cJSON *o;
+
+        if (hit[i] < 0)
         {
             continue;
         }
-        sp = ss->sector->special;
-        if (sp == 4 || sp == 5 || sp == 7 || sp == 16 || sp == 11)
+        near = hit[i];
+        for (j = i; j + 1 < AGENT_FOV_RAYS && hit[j + 1] >= 0; j++)
         {
-            return step;
+            if (hit[j + 1] < near)
+            {
+                near = hit[j + 1];
+            }
         }
+        if (arr == NULL)
+        {
+            arr = cJSON_CreateArray();
+        }
+        o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "bearing",
+                                -AGENT_FOV + (i + j) * AGENT_FOV_STEP / 2);
+        cJSON_AddNumberToObject(o, "width", (j - i + 1) * AGENT_FOV_STEP);
+        cJSON_AddNumberToObject(o, "distance", near);
+        cJSON_AddItemToArray(arr, o);
+        i = j;
     }
-    return -1;
+    if (arr != NULL)
+    {
+        cJSON_AddItemToObject(root, "burningFloor", arr);
+    }
 }
 
 static int Clearance(mobj_t *player, int bearing_deg)
@@ -735,31 +827,7 @@ static void DescribeClearance(cJSON *root)
     }
     cJSON_AddItemToObject(root, "clearance", o);
 
-    /* And which of those ways the floor burns, and from how far off. */
-    {
-        cJSON *b = cJSON_CreateObject();
-        boolean any = false;
-
-        for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
-        {
-            int room = Clearance(player, dirs[i].bearing);
-            int burn = BurningFloorAhead(player, dirs[i].bearing, room);
-
-            if (burn >= 0)
-            {
-                cJSON_AddNumberToObject(b, dirs[i].name, burn);
-                any = true;
-            }
-        }
-        if (any)
-        {
-            cJSON_AddItemToObject(root, "burningFloor", b);
-        }
-        else
-        {
-            cJSON_Delete(b);
-        }
-    }
+    DescribeBurningFloor(root, player);
 }
 
 // The nearest line that ends the level, as a bearing and a distance.
