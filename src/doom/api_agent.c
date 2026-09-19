@@ -66,6 +66,22 @@ typedef struct
     int amount;
 } agent_event_t;
 
+// Damage taken since the last time events were derived, by cause. One tic can
+// hold several - two monsters and the floor - and the interesting one differs
+// by question: the biggest contributor is what is wearing the player down,
+// the last is what landed the killing blow.
+#define AGENT_MAX_CAUSES 8
+
+typedef struct
+{
+    char name[40];
+    int amount;
+} agent_cause_t;
+
+static agent_cause_t causes[AGENT_MAX_CAUSES];
+static int cause_count;
+static char last_cause[40];
+
 static agent_event_t events[AGENT_MAX_EVENTS];
 static int event_count;
 static int events_dropped;
@@ -132,6 +148,70 @@ static void PushEvent(const char *type, const char *detail, int amount)
     }
 }
 
+// What hurt the player, when the engine did not hand over an inflictor. A
+// damaging floor passes NULL as both inflictor and source, so this is where
+// slime, and only slime, ends up.
+static const char *FloorHurtName(void)
+{
+    player_t *p = &players[consoleplayer];
+
+    if (p->mo == NULL)
+    {
+        return "something unseen";
+    }
+    switch (p->mo->subsector->sector->special)
+    {
+        case 4:  return "a damaging floor";
+        case 5:  return "hellslime";
+        case 7:  return "nukage";
+        case 11: return "the exit floor";
+        case 16: return "super hellslime";
+        default: return "something unseen";
+    }
+}
+
+void API_Agent_NoteDamage(mobj_t *source, int damage)
+{
+    const char *name = source != NULL ? API_TypeName(source) : FloorHurtName();
+    int i;
+
+    if (damage <= 0)
+    {
+        return;
+    }
+    M_StringCopy(last_cause, name, sizeof(last_cause));
+    for (i = 0; i < cause_count; i++)
+    {
+        if (strcmp(causes[i].name, name) == 0)
+        {
+            causes[i].amount += damage;
+            return;
+        }
+    }
+    if (cause_count < AGENT_MAX_CAUSES)
+    {
+        M_StringCopy(causes[cause_count].name, name, sizeof(causes[0].name));
+        causes[cause_count].amount = damage;
+        cause_count++;
+    }
+}
+
+// The cause that did the most of the damage in this batch.
+static const char *WorstCause(void)
+{
+    int best = -1;
+    int i;
+
+    for (i = 0; i < cause_count; i++)
+    {
+        if (best < 0 || causes[i].amount > causes[best].amount)
+        {
+            best = i;
+        }
+    }
+    return best < 0 ? NULL : causes[best].name;
+}
+
 static const char *ammo_names[NUMAMMO] = { "bullets", "shells", "cells", "rockets" };
 static const char *weapon_names[NUMWEAPONS] =
 {
@@ -190,7 +270,7 @@ static void DeriveEvents(void)
 
     if (now.health < prev.health)
     {
-        PushEvent("hurt", NULL, prev.health - now.health);
+        PushEvent("hurt", WorstCause(), prev.health - now.health);
     }
     else if (now.health > prev.health)
     {
@@ -235,7 +315,9 @@ static void DeriveEvents(void)
     }
     if (now.dead && !prev.dead)
     {
-        PushEvent("death", NULL, 1);
+        // The last blow, not the worst one: what killed the player is the
+        // thing that was still hitting it at zero health.
+        PushEvent("death", last_cause[0] != 0 ? last_cause : NULL, 1);
     }
     if (now.state != prev.state && now.state != GS_LEVEL && prev.state == GS_LEVEL)
     {
@@ -244,6 +326,7 @@ static void DeriveEvents(void)
     }
 
     prev = now;
+    cause_count = 0;
 }
 
 static cJSON *DescribeEvents(void)

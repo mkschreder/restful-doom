@@ -23,6 +23,15 @@ boolean API_Agent_Lockstep(void);
 // lockstep this is where the loop is handed to the API and blocks.
 void API_Agent_PerTic(void);
 
+// Called from P_DamageMobj whenever the console player loses health, so that
+// a `hurt` or `death` event can name what did it. The EVENT is still derived
+// from the health diff, as every other event is; this only supplies the
+// attribution, which a diff has no way to see - by the time the health has
+// changed, what changed it is gone. An episode that ends in a death is
+// otherwise a mystery: the transcript says the player died at decision 769
+// and nothing at all about what killed it.
+void API_Agent_NoteDamage(mobj_t *source, int damage);
+
 // Endpoints.
 api_response_t API_GetState(void);
 api_response_t API_PostStep(cJSON *req);

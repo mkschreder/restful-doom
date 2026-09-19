@@ -38,6 +38,7 @@
 #include "s_sound.h"
 
 #include "p_inter.h"
+#include "api_agent.h"
 
 
 #define BONUSADD	6
@@ -877,6 +878,13 @@ P_DamageMobj
 	    player->health = 0;
 	
 	player->attacker = source;
+	if (player == &players[consoleplayer])
+	{
+	    // So an agent watching the game can be told what hurt it. Here
+	    // rather than at the health diff because the inflictor is only
+	    // knowable at the moment the damage lands.
+	    API_Agent_NoteDamage (source, damage);
+	}
 	player->damagecount += damage;	// add damage after armor / invuln
 
 	if (player->damagecount > 100)
