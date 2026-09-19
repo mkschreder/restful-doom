@@ -1096,7 +1096,7 @@ static void report_boundary(mobj_t *probe, int *queue)
 /* Build the field once, with `allow_damage` as it stands. False when there is
  * no field to be had; *no_seed says the reason was that no standing spot at
  * the exit could be reached, which is the one failure worth retrying. */
-static boolean build_field(mobj_t *probe, boolean *no_seed)
+static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
 {
     fixed_t minx = 0, miny = 0, maxx = 0, maxy = 0;
     api_point_t spots[API_MAX_EXIT_SPOTS];
@@ -1262,7 +1262,7 @@ static boolean build_field(mobj_t *probe, boolean *no_seed)
      * the same field, flooded from a different place. Picking the key up
      * changes which doors are walls, the grid is rebuilt on that, and the
      * route goes back to pointing at the exit on its own. */
-    if (seed < 0 && keys_wanted != 0)
+    if (seed < 0 && allow_keys && keys_wanted != 0)
     {
         int colour;
 
@@ -1385,25 +1385,42 @@ static void ensure_built(mobj_t *probe)
     built_for = (void *)lines;
     built_count = numlines;
 
-    if (build_field(probe, &no_seed) || !no_seed)
-    {
-        return;
-    }
-    /* Some levels have no dry path. Rather than report no route at all, walk
-     * through the slime and let the agent deal with it.
+    /* Four questions, in the order a player would ask them: can I walk to the
+     * exit, can I if I am willing to wade, is there a key I should fetch
+     * first, and the same again wading.
      *
-     * This retry used to clear built_for and call back into ensure_built,
-     * which saw a level it had not built and reset allow_damage to false on
-     * the way in - so it asked the same question again, got the same answer,
-     * and recursed until the engine stopped answering. E1M2, whose exit is
-     * across nukage, hung on the first observation. */
-    if (!allow_damage)
+     * The order is the whole of it and it used to be wrong: a key outranked
+     * wading, so E1M3 - whose exit is over a bridge with slime either side -
+     * picked up its blue key, found no dry way on, and set off for the YELLOW
+     * one, which opens nothing it needs. Silently, because the "nowhere to
+     * stand at the exit" report only prints when there is no route at all,
+     * and a route to the wrong key is a route.
+     *
+     * The retry used to clear built_for and call back into ensure_built,
+     * which saw a level it had not built and reset allow_damage on the way in
+     * - so it asked the same question again, got the same answer, and
+     * recursed until the engine stopped answering. E1M2, whose exit is across
+     * nukage, hung on its first observation. Hence one flat loop. */
     {
-        printf("API_Route: no dry path to the exit; allowing damaging floor\n");
-        allow_damage = true;
-        if (build_field(probe, &no_seed))
+        static const char *why[4] = {
+            NULL,
+            "no dry way to the exit; wading",
+            "no way to the exit at all; fetching a key first",
+            "no dry way to a key either; wading to one",
+        };
+        int try_;
+
+        for (try_ = 0; try_ < 4; try_++)
         {
-            return;
+            allow_damage = (try_ & 1) != 0;
+            if (build_field(probe, (try_ & 2) != 0, &no_seed))
+            {
+                if (why[try_] != NULL)
+                {
+                    printf("API_Route: %s\n", why[try_]);
+                }
+                return;
+            }
         }
     }
     printf("API_Route: nowhere reachable to stand at the exit\n");
