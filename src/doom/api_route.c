@@ -89,6 +89,37 @@ static boolean route_blocked;
  * build is keyed on which of them applies. */
 static int held_keys;
 static int keys_wanted;
+/* Shut sectors on the way to the exit that only a switch elsewhere opens, and
+ * the one the route has settled on leading to. A level's lifts and its
+ * switch-operated doors are these, and they are as much a part of the way
+ * through as a keycard is. */
+#define ROUTE_MAX_WANTED 16
+static sector_t *wanted_sectors[ROUTE_MAX_WANTED];
+static int wanted_count;
+static boolean route_goal_switch;
+/* The switch the route is leading to, when it is leading to one. */
+static fixed_t route_switch_x, route_switch_y;
+
+static void want_sector(sector_t *sec)
+{
+    int i;
+
+    if (sec == NULL || sec->tag == 0)
+    {
+        return;
+    }
+    for (i = 0; i < wanted_count; i++)
+    {
+        if (wanted_sectors[i] == sec)
+        {
+            return;
+        }
+    }
+    if (wanted_count < ROUTE_MAX_WANTED)
+    {
+        wanted_sectors[wanted_count++] = sec;
+    }
+}
 
 /* The colour of key a line demands, or 0. Both the doors a player opens by
  * walking into them and the ones a switch opens remotely; the numbers are
@@ -153,9 +184,23 @@ static boolean line_passable(line_t *ld)
      * across three cells for six hundred decisions with the bearing pointing
      * into the wall twenty-five units ahead. */
     P_LineOpening(ld);
-    if (openrange < ROUTE_HEIGHT && !line_can_open(ld))
+    if (openrange < ROUTE_HEIGHT)
     {
-        return false;
+        if (!line_can_open(ld))
+        {
+            return false;
+        }
+        if (ld->special == 0)
+        {
+            /* Shut, and nothing about THIS line opens it: a switch somewhere
+             * else does. That is a wall as far as walking is concerned, in
+             * exactly the way a locked door is - the player has to go and do
+             * something first - so it is treated the same way, and the sector
+             * is remembered so the route can lead to its switch. */
+            want_sector(ld->backsector != NULL && ld->backsector->tag != 0
+                            ? ld->backsector : ld->frontsector);
+            return false;
+        }
     }
     lock = lock_of(ld);
     if (lock != 0 && !(held_keys & (1 << lock)))
@@ -1093,6 +1138,107 @@ static void report_boundary(mobj_t *probe, int *queue)
     report_fit_path(queue);
 }
 
+/* Whether opening this sector would join the player's side of the level to
+ * the exit's.
+ *
+ * A level is full of shut sectors some switch opens - every lift, every
+ * switch-door, every raising floor - and all but one of them is irrelevant to
+ * getting out. Taking the first one found sent E1M2's player to a switch
+ * fourteen hundred units the wrong way, which it duly pressed, after which the
+ * route wanted a different switch four thousand units further off.
+ *
+ * The one that matters is the one with the player on one side and the exit on
+ * the other, and that is answerable without opening anything: sample just off
+ * each of the sector's own lines and see which of the two islands the cell
+ * there belongs to. Off the LINES rather than inside the sector, because these
+ * things are often a few units thick - the diagonal slab this was written for
+ * is eleven - and no cell centre lands inside them at all. */
+static boolean sector_joins(sector_t *sec, const unsigned short *island)
+{
+    boolean touches_player = false, touches_exit = false;
+    int i;
+
+    for (i = 0; i < numlines && !(touches_player && touches_exit); i++)
+    {
+        line_t *ld = &lines[i];
+        fixed_t dx, dy, len, mx, my;
+        int side;
+
+        if (ld->frontsector != sec && ld->backsector != sec)
+        {
+            continue;
+        }
+        dx = ld->v2->x - ld->v1->x;
+        dy = ld->v2->y - ld->v1->y;
+        len = P_AproxDistance(dx, dy);
+        if (len <= 0)
+        {
+            continue;
+        }
+        mx = (ld->v1->x + ld->v2->x) / 2;
+        my = (ld->v1->y + ld->v2->y) / 2;
+        for (side = 0; side < 2; side++)
+        {
+            fixed_t sign = side == 0 ? FRACUNIT : -FRACUNIT;
+            fixed_t nx = FixedDiv(FixedMul(dy, sign), len);
+            fixed_t ny = FixedDiv(FixedMul(-dx, sign), len);
+            fixed_t px = mx + FixedMul(40 * FRACUNIT, nx);
+            fixed_t py = my + FixedMul(40 * FRACUNIT, ny);
+            int cx, cy, ci;
+
+            if (!cell_of(px, py, &cx, &cy))
+            {
+                continue;
+            }
+            ci = cy * grid_w + cx;
+            touches_player |= reachable[ci] != ROUTE_UNREACHED;
+            touches_exit |= island[ci] != ROUTE_UNREACHED;
+        }
+    }
+    return touches_player && touches_exit;
+}
+
+/* A walkable place to stand in front of a switch line, on either side.
+ *
+ * Not the line's own midpoint, which is inside the wall the switch is mounted
+ * on - the same reason the exit's spots are offsets rather than the exit line
+ * itself. */
+static boolean opener_spot(mobj_t *probe, line_t *ld, fixed_t *ox, fixed_t *oy)
+{
+    static const int offsets[] = { 32, 48, 64, 96 };
+    fixed_t dx = ld->v2->x - ld->v1->x;
+    fixed_t dy = ld->v2->y - ld->v1->y;
+    fixed_t len = P_AproxDistance(dx, dy);
+    fixed_t mx = (ld->v1->x + ld->v2->x) / 2;
+    fixed_t my = (ld->v1->y + ld->v2->y) / 2;
+    unsigned int oi;
+    int side;
+
+    if (len <= 0)
+    {
+        return false;
+    }
+    for (oi = 0; oi < sizeof(offsets) / sizeof(offsets[0]); oi++)
+    {
+        for (side = 0; side < 2; side++)
+        {
+            fixed_t sign = side == 0 ? FRACUNIT : -FRACUNIT;
+            fixed_t nx = FixedDiv(FixedMul(dy, sign), len);
+            fixed_t ny = FixedDiv(FixedMul(-dx, sign), len);
+            fixed_t px = mx + FixedMul(offsets[oi] * FRACUNIT, nx);
+            fixed_t py = my + FixedMul(offsets[oi] * FRACUNIT, ny);
+
+            if (walkable(probe, px, py))
+            {
+                *ox = px;
+                *oy = py;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* Build the field once, with `allow_damage` as it stands. False when there is
  * no field to be had; *no_seed says the reason was that no standing spot at
  * the exit could be reached, which is the one failure worth retrying. */
@@ -1112,6 +1258,8 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
     held_keys = keys_of(probe);
     keys_wanted = 0;
     route_goal_key = 0;
+    route_goal_switch = false;
+    wanted_count = 0;
 
     n_spots = API_ExitSpots(probe, spots, API_MAX_EXIT_SPOTS);
     if (numvertexes <= 0 || n_spots == 0)
@@ -1286,6 +1434,64 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
             break;
         }
     }
+    /* Still nothing, and a shut sector some switch opens is why: head for the
+     * switch. The same move as the key, for the same reason - it is the
+     * level's own next objective - and the same machinery: one field, flooded
+     * from somewhere else. E1M2's way on from the red key is exactly this,
+     * and being told only "a wall" had a follower shoving at it for six
+     * hundred decisions with the switch a hundred units to its left. */
+    if (seed < 0 && allow_keys && wanted_count > 0)
+    {
+        unsigned short *island = malloc(sizeof(unsigned short) * grid_w * grid_h);
+        int w, exit_cell = -1;
+
+        /* The exit's own side of the level, to tell the one switch that leads
+         * out from the dozen that do not. */
+        for (i = 0; i < n_spots && exit_cell < 0; i++)
+        {
+            int sx, sy;
+
+            if (cell_of(spots[i].x, spots[i].y, &sx, &sy) && walk[sy * grid_w + sx])
+            {
+                exit_cell = sy * grid_w + sx;
+            }
+        }
+        if (island != NULL && exit_cell >= 0)
+        {
+            flood(island, exit_cell, queue);
+        }
+        for (w = 0; w < wanted_count && seed < 0; w++)
+        {
+            int j;
+
+            if (island == NULL || exit_cell < 0 || !sector_joins(wanted_sectors[w], island))
+            {
+                continue;
+            }
+            for (j = 0; j < numlines; j++)
+            {
+                line_t *ld = &lines[j];
+                fixed_t sx, sy;
+                int scx, scy;
+
+                if (ld->special == 0 || ld->tag != wanted_sectors[w]->tag)
+                {
+                    continue;
+                }
+                if (!opener_spot(probe, ld, &sx, &sy) || !cell_of(sx, sy, &scx, &scy)
+                    || reachable[scy * grid_w + scx] == ROUTE_UNREACHED)
+                {
+                    continue;
+                }
+                seed = scy * grid_w + scx;
+                route_goal_switch = true;
+                route_switch_x = (ld->v1->x + ld->v2->x) / 2;
+                route_switch_y = (ld->v1->y + ld->v2->y) / 2;
+                break;
+            }
+        }
+        free(island);
+    }
 
     if (seed < 0)
     {
@@ -1364,12 +1570,35 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
 
 /* Rebuild when the level changed. Keyed on the `lines` array, which a level
  * reload reallocates - a stale field would route through a map that is gone. */
+/* Whether a shut sector the route was waiting on has since been opened.
+ *
+ * The grid describes the level as it was when it was built, and a switch is
+ * the player CHANGING the level. Without this the field goes on routing to a
+ * switch that has already been pressed, which is the same class of mistake as
+ * routing to a key already picked up - and that one is caught because holding
+ * the key is part of the build stamp. This is the rest of that stamp. */
+static boolean wanted_sector_opened(void)
+{
+    int i;
+
+    for (i = 0; i < wanted_count; i++)
+    {
+        sector_t *sec = wanted_sectors[i];
+
+        if (sec->ceilingheight - sec->floorheight >= ROUTE_HEIGHT)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void ensure_built(mobj_t *probe)
 {
     boolean no_seed;
 
     if (field != NULL && built_for == (void *)lines && built_count == numlines
-        && built_keys == keys_of(probe))
+        && built_keys == keys_of(probe) && !wanted_sector_opened())
     {
         return;
     }
@@ -1480,6 +1709,75 @@ static boolean can_walk_to(mobj_t *player, fixed_t x, fixed_t y)
     return !walk_blocked;
 }
 
+/* The nearest line whose special operates this sector's tag: the switch that
+ * opens it.
+ *
+ * A tag can be operated from several places and any of them will do, so the
+ * nearest is the answer. This is the level's own wiring read back: the mapper
+ * joined a switch to a sector by giving both the same number, and that number
+ * is still there to be read. */
+static line_t *opener_of(sector_t *sec, fixed_t x, fixed_t y)
+{
+    line_t *best = NULL;
+    fixed_t best_d = 0;
+    int i;
+
+    if (sec == NULL || sec->tag == 0)
+    {
+        return NULL;
+    }
+    for (i = 0; i < numlines; i++)
+    {
+        line_t *ld = &lines[i];
+        fixed_t mx, my, d;
+
+        if (ld->special == 0 || ld->tag != sec->tag)
+        {
+            continue;
+        }
+        mx = (ld->v1->x + ld->v2->x) / 2;
+        my = (ld->v1->y + ld->v2->y) / 2;
+        d = P_AproxDistance(mx - x, my - y);
+        if (best == NULL || d < best_d)
+        {
+            best = ld;
+            best_d = d;
+        }
+    }
+    return best;
+}
+
+/* Say where the switch is, when the thing in the way is not one the player can
+ * open by pushing on it.
+ *
+ * E1M2's is the case this was written for. The way on from the red key is
+ * through a sector of zero height that a switch a hundred units off to one
+ * side raises; every walk test correctly refuses to cross it, the route
+ * correctly runs through it, and the agent was told "a wall" - so it pushed at
+ * the wall for six hundred decisions with the switch in plain view beside it. */
+static void note_opener(mobj_t *player, line_t *shut, api_route_t *out)
+{
+    line_t *sw;
+
+    if (shut == NULL || shut->special != 0)
+    {
+        /* It opens itself: pushing on it is the whole of the answer. */
+        return;
+    }
+    sw = opener_of(shut->backsector, player->x, player->y);
+    if (sw == NULL)
+    {
+        sw = opener_of(shut->frontsector, player->x, player->y);
+    }
+    if (sw == NULL)
+    {
+        return;
+    }
+    out->have_switch = true;
+    out->switch_x = (sw->v1->x + sw->v2->x) / 2;
+    out->switch_y = (sw->v1->y + sw->v2->y) / 2;
+}
+
 static line_t *shut_door_line;
 static fixed_t shut_door_frac;
 
@@ -1544,6 +1842,7 @@ static void note_shut_door(mobj_t *player, api_route_t *out)
         out->can_open = true;
         out->block_x = player->x + FixedMul(tx - player->x, shut_door_frac);
         out->block_y = player->y + FixedMul(ty - player->y, shut_door_frac);
+        note_opener(player, shut_door_line, out);
     }
 }
 
@@ -1621,7 +1920,10 @@ boolean API_Route(mobj_t *player, api_route_t *out)
         out->have_step = true;
         out->blocked = false;
         out->can_open = false;
+        out->have_switch = false;
         out->goal_key = route_goal_key;
+        out->goal_switch = route_goal_switch;
+    out->goal_switch = route_goal_switch;
         out->x = cell_x(best % grid_w);
         out->y = cell_y(best / grid_w);
         note_shut_door(player, out);
@@ -1632,9 +1934,27 @@ boolean API_Route(mobj_t *player, api_route_t *out)
     out->have_step = false;
     out->blocked = false;
     out->can_open = false;
+    out->have_switch = false;
     out->goal_key = route_goal_key;
+    out->goal_switch = route_goal_switch;
     if (field[at] == 0)
     {
+        /* Standing at the goal. When the goal is a switch that is not the end
+         * of it: the whole point of walking here was to press the thing, and
+         * an agent told only "you have arrived" has nothing left to do and
+         * wanders off - measured on E1M2, which reached its switch at
+         * decision 162 and spent the next twelve hundred decisions elsewhere.
+         * A key needs no such thing, because walking onto one picks it up. */
+        if (route_goal_switch)
+        {
+            out->blocked = true;
+            out->can_open = false;
+            out->have_switch = true;
+            out->block_x = route_switch_x;
+            out->block_y = route_switch_y;
+            out->switch_x = route_switch_x;
+            out->switch_y = route_switch_y;
+        }
         return true;
     }
 
@@ -1729,6 +2049,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
                 out->can_open = ld->special != 0;
                 out->block_x = player->x + FixedMul(tx - player->x, walk_block_frac);
                 out->block_y = player->y + FixedMul(ty - player->y, walk_block_frac);
+                note_opener(player, ld, out);
             }
             /* A diagonal the player cannot walk straight at is still a
              * corner they can round: go via one of its two legs.

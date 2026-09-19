@@ -20,11 +20,23 @@ typedef struct {
     boolean can_open;
     fixed_t block_x;
     fixed_t block_y;
+    /* Where the switch is, when what is in the way is opened from somewhere
+     * else. DOOM's walls are full of these: a sector with a tag, and a line
+     * carrying the special that operates that tag, standing somewhere the
+     * player has to walk to. Nothing about the shut sector itself says where
+     * that line is, so an agent looking at it can only push. */
+    boolean have_switch;
+    fixed_t switch_x;
+    fixed_t switch_y;
     /* What this route actually leads to. 0 is the exit; otherwise the colour
      * of the key that the exit is locked behind, which the route heads for
      * first. Calling a key "the exit" in the observation would be a lie the
      * agent has no way to catch. */
     int goal_key;
+    /* Whether what this route leads to is a switch that opens the way on,
+     * rather than the exit or a key. Same idea as `goal_key`: the level's own
+     * next objective, and calling it "the exit" would be a lie. */
+    boolean goal_switch;
 } api_route_t;
 
 /* Where to go next to make progress toward the exit. False when the level has

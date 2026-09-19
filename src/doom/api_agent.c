@@ -795,7 +795,11 @@ static void DescribeExit(cJSON *root)
                 // locked door gives an agent two jobs, and the route does the
                 // first one for it - but calling a key "the exit" would be a
                 // lie the agent has no way to catch.
-                if (route.goal_key > 0)
+                if (route.goal_switch)
+                {
+                    cJSON_AddStringToObject(o, "goal", "switch");
+                }
+                else if (route.goal_key > 0)
                 {
                     cJSON_AddStringToObject(o, "goal", key_colour[route.goal_key]);
                 }
@@ -829,13 +833,34 @@ static void DescribeExit(cJSON *root)
                     {
                         brel -= 360;
                     }
-                    cJSON_AddStringToObject(b, "kind",
-                                            route.can_open ? "door" : "wall");
+                    cJSON_AddStringToObject(
+                        b, "kind",
+                        route.have_switch ? "switch" : route.can_open ? "door" : "wall");
                     cJSON_AddNumberToObject(b, "bearing", brel);
                     cJSON_AddNumberToObject(
                         b, "distance",
                         (int)API_FixedToFloat(P_AproxDistance(
                             player->x - route.block_x, player->y - route.block_y)));
+                    if (route.have_switch)
+                    {
+                        /* Where to go and press, since pushing on the thing
+                         * itself does nothing. */
+                        angle_t sa = R_PointToAngle2(player->x, player->y,
+                                                     route.switch_x, route.switch_y);
+                        int srel = angleToDegrees(sa - player->angle);
+                        cJSON *sw = cJSON_CreateObject();
+
+                        if (srel > 180)
+                        {
+                            srel -= 360;
+                        }
+                        cJSON_AddNumberToObject(sw, "bearing", srel);
+                        cJSON_AddNumberToObject(
+                            sw, "distance",
+                            (int)API_FixedToFloat(P_AproxDistance(
+                                player->x - route.switch_x, player->y - route.switch_y)));
+                        cJSON_AddItemToObject(b, "switch", sw);
+                    }
                     cJSON_AddItemToObject(o, "blockedBy", b);
                 }
             }
