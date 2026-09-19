@@ -1365,6 +1365,73 @@ static boolean can_walk_to(mobj_t *player, fixed_t x, fixed_t y)
     return !walk_blocked;
 }
 
+static line_t *shut_door_line;
+static fixed_t shut_door_frac;
+
+static boolean PTR_DoorTraverse(intercept_t *in)
+{
+    line_t *ld = in->d.line;
+
+    if (ld->backsector == NULL || ld->frontsector == NULL)
+    {
+        /* A wall. Whatever is behind it is not on the way to anywhere. */
+        return false;
+    }
+    P_LineOpening(ld);
+    if (openrange >= ROUTE_HEIGHT)
+    {
+        return true;
+    }
+    if (!line_can_open(ld))
+    {
+        return false;
+    }
+    shut_door_line = ld;
+    shut_door_frac = in->frac;
+    return false;
+}
+
+/* Say so when a shut door stands between the player and where the route is
+ * sending them.
+ *
+ * The field crosses doors on purpose - a player opens them - so "go north"
+ * and "there is a door in the way" are both true, and the agent needs to be
+ * told the second or the first is an instruction to press into wood. Until
+ * this existed the only thing that reported a door was the walk test FAILING,
+ * which is an accident waiting to happen: a cell centre can land exactly on a
+ * linedef, and a traverse that ends on a line does not reliably intercept it.
+ * Measured on E1M3, whose starting room's door lies along a row of cell
+ * centres - every test said the way was clear, and the scripted player walked
+ * at that door for the whole of fourteen hundred decisions. */
+static void note_shut_door(mobj_t *player, api_route_t *out)
+{
+    fixed_t dx, dy, len, tx, ty;
+
+    if (!out->have_step || out->blocked)
+    {
+        return;
+    }
+    dx = out->x - player->x;
+    dy = out->y - player->y;
+    len = P_AproxDistance(dx, dy);
+    if (len <= 0)
+    {
+        return;
+    }
+    /* Past the waypoint by a step, so a door sitting exactly on it counts. */
+    tx = out->x + FixedMul(FixedDiv(dx, len), 24 * FRACUNIT);
+    ty = out->y + FixedMul(FixedDiv(dy, len), 24 * FRACUNIT);
+    shut_door_line = NULL;
+    P_PathTraverse(player->x, player->y, tx, ty, PT_ADDLINES, PTR_DoorTraverse);
+    if (shut_door_line != NULL)
+    {
+        out->blocked = true;
+        out->can_open = true;
+        out->block_x = player->x + FixedMul(tx - player->x, shut_door_frac);
+        out->block_y = player->y + FixedMul(ty - player->y, shut_door_frac);
+    }
+}
+
 boolean API_Route(mobj_t *player, api_route_t *out)
 {
     int cx, cy, at, steps;
@@ -1442,6 +1509,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
         out->goal_key = route_goal_key;
         out->x = cell_x(best % grid_w);
         out->y = cell_y(best / grid_w);
+        note_shut_door(player, out);
         return true;
     }
 
@@ -1588,6 +1656,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
                         out->have_step = true;
                         out->x = cell_x(pick % grid_w);
                         out->y = cell_y(pick / grid_w);
+                        note_shut_door(player, out);
                         return true;
                     }
                 }
@@ -1664,6 +1733,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
                     out->have_step = true;
                     out->x = cell_x(best % grid_w);
                     out->y = cell_y(best / grid_w);
+                    note_shut_door(player, out);
                     return true;
                 }
             }
@@ -1679,6 +1749,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
     out->have_step = true;
     out->x = cell_x(bx);
     out->y = cell_y(by);
+    note_shut_door(player, out);
     return true;
 }
 
