@@ -2758,6 +2758,27 @@ boolean API_Route(mobj_t *player, api_route_t *out)
                     return true;
                 }
             }
+            /* Nothing closer is straight ahead from where the player is
+             * STANDING. Which neighbours are reachable depends on exactly
+             * where in the cell they are, so the last resort is to stand in
+             * the middle of it and ask again - which is what a person does
+             * when they clip a doorframe. Measured on E1M2: two cells, eight
+             * hundred decisions, two steps from the frontier, with the step
+             * it needed refused from one side of the cell and open from the
+             * other. */
+            {
+                fixed_t mx = cell_x(cx), my = cell_y(cy);
+
+                if (P_AproxDistance(mx - player->x, my - player->y) > 8 * FRACUNIT
+                    && can_walk_to(player, mx, my))
+                {
+                    out->have_step = true;
+                    out->x = mx;
+                    out->y = my;
+                    note_shut_door(player, out);
+                    return true;
+                }
+            }
             bx = first % grid_w;
             by = first / grid_w;
         }
