@@ -35,6 +35,7 @@
 #include <string.h>
 
 #include "api_route.h"
+#include "api_object_controller.h"
 #include "doomstat.h"
 #include "p_local.h"
 #include "r_main.h"
@@ -2136,6 +2137,95 @@ static void note_opener(mobj_t *player, line_t *shut, api_route_t *out)
     out->switch_y = (sw->v1->y + sw->v2->y) / 2;
 }
 
+/* The solid thing found standing between the player and the next waypoint. */
+static mobj_t *block_probe_self;
+static fixed_t block_probe_x, block_probe_y;
+static mobj_t *block_probe_hit;
+
+static boolean PIT_ThingInTheWay(mobj_t *th)
+{
+    fixed_t reach;
+
+    if (th == block_probe_self || !(th->flags & MF_SOLID))
+    {
+        return true;
+    }
+    reach = block_probe_self->radius + th->radius;
+    if (abs(th->x - block_probe_x) >= reach || abs(th->y - block_probe_y) >= reach)
+    {
+        return true;
+    }
+    /* Something the player can step over or duck under is not in the way. */
+    if (th->z >= block_probe_self->z + block_probe_self->height
+        || th->z + th->height <= block_probe_self->z)
+    {
+        return true;
+    }
+    block_probe_hit = th;
+    return false;
+}
+
+/* What is standing between here and there, if anything is.
+ *
+ * Sampled along the line at half the player's width, because a thing is a
+ * circle and the question is whether the player's own circle can pass it. The
+ * route's own tests are all about LINES - it is a distance field over the
+ * level's geometry, and the geometry does not move - so without this a
+ * barrel in a doorway is a route the agent is told is clear and cannot walk,
+ * and the only symptom is a player pressing forward for six hundred
+ * decisions with a correct bearing. */
+static mobj_t *thing_in_the_way(mobj_t *player, fixed_t tx, fixed_t ty)
+{
+    fixed_t dx = tx - player->x, dy = ty - player->y;
+    fixed_t len = P_AproxDistance(dx, dy);
+    int steps, i;
+
+    if (len <= 0)
+    {
+        return NULL;
+    }
+    /* Only what is immediately in the way. The waypoint can be four cells
+     * off, and a solid thing anywhere along that line is not necessarily
+     * something the player will even brush - Doom slides them past whatever
+     * they touch. Within one decision's walking it is a different matter:
+     * there is no getting past a barrel filling the doorway in front of you
+     * without doing something about it. */
+    if (len > 96 * FRACUNIT)
+    {
+        len = 96 * FRACUNIT;
+        dx = FixedMul(FixedDiv(dx, P_AproxDistance(dx, dy)), len);
+        dy = FixedMul(FixedDiv(dy, P_AproxDistance(dx, dy)), len);
+    }
+    steps = (len >> FRACBITS) / 16 + 1;
+    block_probe_self = player;
+    for (i = 1; i <= steps; i++)
+    {
+        fixed_t px = player->x + dx * i / steps;
+        fixed_t py = player->y + dy * i / steps;
+        fixed_t dist = player->radius + MAXRADIUS;
+        int xl, xh, yl, yh, bx, by;
+
+        block_probe_x = px;
+        block_probe_y = py;
+        block_probe_hit = NULL;
+        xl = (px - dist - bmaporgx) >> MAPBLOCKSHIFT;
+        xh = (px + dist - bmaporgx) >> MAPBLOCKSHIFT;
+        yl = (py - dist - bmaporgy) >> MAPBLOCKSHIFT;
+        yh = (py + dist - bmaporgy) >> MAPBLOCKSHIFT;
+        for (bx = xl; bx <= xh; bx++)
+        {
+            for (by = yl; by <= yh; by++)
+            {
+                if (!P_BlockThingsIterator(bx, by, PIT_ThingInTheWay))
+                {
+                    return block_probe_hit;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 static line_t *shut_door_line;
 static fixed_t shut_door_frac;
 
@@ -2181,6 +2271,19 @@ static void note_shut_door(mobj_t *player, api_route_t *out)
     if (!out->have_step || out->blocked)
     {
         return;
+    }
+    {
+        mobj_t *th = thing_in_the_way(player, out->x, out->y);
+
+        if (th != NULL)
+        {
+            out->blocked_by_thing = true;
+            out->thing_x = th->x;
+            out->thing_y = th->y;
+            out->thing_what = API_TypeName(th);
+            out->thing_alive = (th->flags & MF_COUNTKILL) != 0 && th->health > 0;
+            return;
+        }
     }
     dx = out->x - player->x;
     dy = out->y - player->y;
@@ -2321,6 +2424,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
         out->blocked = false;
         out->can_open = false;
         out->have_switch = false;
+        out->blocked_by_thing = false;
         out->goal_key = route_goal_key;
         out->goal_switch = route_goal_switch;
         out->goal_frontier = route_goal_frontier;
@@ -2336,6 +2440,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
     out->blocked = false;
     out->can_open = false;
     out->have_switch = false;
+    out->blocked_by_thing = false;
     out->goal_key = route_goal_key;
     out->goal_switch = route_goal_switch;
     out->goal_frontier = route_goal_frontier;

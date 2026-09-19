@@ -37,6 +37,19 @@ typedef struct {
      * rather than the exit or a key. Same idea as `goal_key`: the level's own
      * next objective, and calling it "the exit" would be a lie. */
     boolean goal_switch;
+    /* A THING standing in the way of the next step - a monster, a barrel, a
+     * lamp. The grid is geometry and deliberately knows nothing about who is
+     * standing in it, so a perfectly good route can be one the player cannot
+     * walk, and from outside that is indistinguishable from a route that is
+     * wrong: the bearing is right, the way is clear, and the player does not
+     * move. */
+    boolean blocked_by_thing;
+    fixed_t thing_x;
+    fixed_t thing_y;
+    const char *thing_what;
+    /* Whether that thing is alive - something to shoot - as opposed to a
+     * barrel or a lamp, which is something to walk round. */
+    boolean thing_alive;
     /* Whether this route leads to unexplored ground rather than to anything
      * the player has found yet. Under fair play this is most of a level: the
      * exit is not a goal until it has been seen. */

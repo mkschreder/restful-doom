@@ -859,7 +859,33 @@ static void DescribeExit(cJSON *root)
                 // What is in the way, when the route says one thing and the
                 // player's body says another. Almost always a shut door: the
                 // route runs through doors because a player opens them.
-                if (route.blocked)
+                if (route.blocked_by_thing)
+                {
+                    // Something is standing in the way. The route is over
+                    // geometry and cannot see it; the player can, and walking
+                    // at it forever is what happens when nothing says so.
+                    angle_t ta = R_PointToAngle2(player->x, player->y,
+                                                 route.thing_x, route.thing_y);
+                    int trel = angleToDegrees(ta - player->angle);
+                    cJSON *b = cJSON_CreateObject();
+
+                    if (trel > 180)
+                    {
+                        trel -= 360;
+                    }
+                    cJSON_AddStringToObject(b, "kind", "thing");
+                    cJSON_AddStringToObject(b, "what",
+                                            route.thing_what != NULL
+                                                ? route.thing_what : "something");
+                    cJSON_AddBoolToObject(b, "alive", route.thing_alive);
+                    cJSON_AddNumberToObject(b, "bearing", trel);
+                    cJSON_AddNumberToObject(
+                        b, "distance",
+                        (int)API_FixedToFloat(P_AproxDistance(
+                            player->x - route.thing_x, player->y - route.thing_y)));
+                    cJSON_AddItemToObject(o, "blockedBy", b);
+                }
+                else if (route.blocked)
                 {
                     angle_t ba = R_PointToAngle2(player->x, player->y,
                                                  route.block_x, route.block_y);
