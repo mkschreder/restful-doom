@@ -654,6 +654,48 @@ static boolean PTR_ProbeTraverse(intercept_t *in)
     return true;
 }
 
+/* How far the player could walk this way before the floor starts hurting,
+ * capped at the clearance in that direction.
+ *
+ * A player SEES nukage: it is a different floor, lit differently, and every
+ * one of them learns within a minute of their first game that the green
+ * sludge takes health off you. An agent told only "the floor you are standing
+ * on is burning you" cannot learn that, because nothing in its observation
+ * distinguishes a corridor from a corridor with a pool in it until it is
+ * already standing in the pool. That is not a hard reinforcement-learning
+ * problem, it is an unlearnable one: the feature the rule depends on is not
+ * in the state.
+ *
+ * Sampled along the ray at half the player's width, and reported only out to
+ * where the player could actually walk - you cannot see the floor through a
+ * wall. */
+static int BurningFloorAhead(mobj_t *player, int bearing_deg, int clearance)
+{
+    angle_t a = player->angle + degreesToAngle(bearing_deg);
+    fixed_t fx = finecosine[a >> ANGLETOFINESHIFT];
+    fixed_t fy = finesine[a >> ANGLETOFINESHIFT];
+    int step;
+
+    for (step = 0; step <= clearance; step += 16)
+    {
+        fixed_t px = player->x + FixedMul(step << FRACBITS, fx);
+        fixed_t py = player->y + FixedMul(step << FRACBITS, fy);
+        subsector_t *ss = R_PointInSubsector(px, py);
+        int sp;
+
+        if (ss == NULL || ss->sector == NULL)
+        {
+            continue;
+        }
+        sp = ss->sector->special;
+        if (sp == 4 || sp == 5 || sp == 7 || sp == 16 || sp == 11)
+        {
+            return step;
+        }
+    }
+    return -1;
+}
+
 static int Clearance(mobj_t *player, int bearing_deg)
 {
     angle_t a = player->angle + degreesToAngle(bearing_deg);
@@ -692,6 +734,32 @@ static void DescribeClearance(cJSON *root)
         cJSON_AddNumberToObject(o, dirs[i].name, Clearance(player, dirs[i].bearing));
     }
     cJSON_AddItemToObject(root, "clearance", o);
+
+    /* And which of those ways the floor burns, and from how far off. */
+    {
+        cJSON *b = cJSON_CreateObject();
+        boolean any = false;
+
+        for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+        {
+            int room = Clearance(player, dirs[i].bearing);
+            int burn = BurningFloorAhead(player, dirs[i].bearing, room);
+
+            if (burn >= 0)
+            {
+                cJSON_AddNumberToObject(b, dirs[i].name, burn);
+                any = true;
+            }
+        }
+        if (any)
+        {
+            cJSON_AddItemToObject(root, "burningFloor", b);
+        }
+        else
+        {
+            cJSON_Delete(b);
+        }
+    }
 }
 
 // The nearest line that ends the level, as a bearing and a distance.
