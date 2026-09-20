@@ -51,6 +51,13 @@
 // 7 is the gentlest damaging floor DOOM has: five points every 32 tics.
 #define BURNING_FLOOR 7
 
+// W1 Exit Level. A DOOM level ends at a LINE, not at an object, and the route
+// can only lead somewhere it can see a line for. A scenario whose task is to
+// get somewhere therefore needs a real one: without it the route has no goal
+// at all, falls back to frontier exploration for the whole episode, and the
+// policy never once practises the thing every real level asks of it.
+#define EXIT_LINE 52
+
 // ---------------------------------------------------------------- the dice
 //
 // Map generation must not draw on the game's own randomness. M_Random is a
@@ -101,7 +108,6 @@ typedef struct
     rng_t rng;
 
     int kills_to_win;       // ends the episode when every monster is dead
-    int goal_armor;         // ends the episode when the player picks up armour
     int one_hit_monsters;   // every monster spawns with one hit point
     int freeze_monsters;    // monsters stay where they were put
 
@@ -144,7 +150,8 @@ typedef struct
 // A spanning tree over an n x n grid of rooms joined by short corridors, so
 // every room is reachable and exactly one route joins any two of them.
 static void build_maze(plan_t *p, int n, int special, const char *floorpic,
-                       const char *const *textures, int ntex, int *roomsector)
+                       const char *const *textures, int ntex, int *roomsector,
+                       int exit_room)
 {
     int east[8][8], north[8][8];
     int corr_h[8][8], corr_v[8][8];
@@ -255,6 +262,10 @@ static void build_maze(plan_t *p, int n, int special, const char *floorpic,
                 MapGen_AddWall(p->m, x1, y1, x1, my - MAZE_HALFDOOR, s, tex);
                 MapGen_AddPortal(p->m, x1, my - MAZE_HALFDOOR, x1, my + MAZE_HALFDOOR,
                                  s, back, NULL, NULL, NULL);
+                if (cy * n + cx == exit_room)
+                {
+                    MapGen_SetLineSpecial(p->m, EXIT_LINE, 0);
+                }
                 MapGen_AddWall(p->m, x1, my + MAZE_HALFDOOR, x1, y2, s, tex);
             }
             else
@@ -269,6 +280,10 @@ static void build_maze(plan_t *p, int n, int special, const char *floorpic,
                 MapGen_AddWall(p->m, x1, y2, mx - MAZE_HALFDOOR, y2, s, tex);
                 MapGen_AddPortal(p->m, mx - MAZE_HALFDOOR, y2, mx + MAZE_HALFDOOR, y2,
                                  s, back, NULL, NULL, NULL);
+                if (cy * n + cx == exit_room)
+                {
+                    MapGen_SetLineSpecial(p->m, EXIT_LINE, 0);
+                }
                 MapGen_AddWall(p->m, mx + MAZE_HALFDOOR, y2, x2, y2, s, tex);
             }
             else
@@ -283,6 +298,10 @@ static void build_maze(plan_t *p, int n, int special, const char *floorpic,
                 MapGen_AddWall(p->m, x2, y2, x2, my + MAZE_HALFDOOR, s, tex);
                 MapGen_AddPortal(p->m, x2, my + MAZE_HALFDOOR, x2, my - MAZE_HALFDOOR,
                                  s, back, NULL, NULL, NULL);
+                if (cy * n + cx == exit_room)
+                {
+                    MapGen_SetLineSpecial(p->m, EXIT_LINE, 0);
+                }
                 MapGen_AddWall(p->m, x2, my - MAZE_HALFDOOR, x2, y1, s, tex);
             }
             else
@@ -297,6 +316,10 @@ static void build_maze(plan_t *p, int n, int special, const char *floorpic,
                 MapGen_AddWall(p->m, x2, y1, mx + MAZE_HALFDOOR, y1, s, tex);
                 MapGen_AddPortal(p->m, mx + MAZE_HALFDOOR, y1, mx - MAZE_HALFDOOR, y1,
                                  s, back, NULL, NULL, NULL);
+                if (cy * n + cx == exit_room)
+                {
+                    MapGen_SetLineSpecial(p->m, EXIT_LINE, 0);
+                }
                 MapGen_AddWall(p->m, mx - MAZE_HALFDOOR, y1, x1, y1, s, tex);
             }
             else
@@ -363,7 +386,23 @@ static void build_deadly_corridor(plan_t *p)
     int s = MapGen_AddSector(p->m, 0, 128, "FLOOR0_1", "CEIL3_5", 144, 0, 0);
     int k;
 
-    MapGen_AddRoom(p->m, 0, 0, 320, 2304, s, "BROWN1");
+    // The corridor, with its last stretch cut off as a sector of its own so
+    // that the line between them can be the exit. Without a real exit line
+    // the route has nothing to lead to and the whole run is frontier
+    // exploration, which is not what the corridor is for.
+    {
+        int end = MapGen_AddSector(p->m, 0, 128, "FLOOR0_1", "CEIL3_5", 192, 0, 0);
+
+        MapGen_AddWall(p->m, 0, 0, 0, 2176, s, "BROWN1");
+        MapGen_AddPortal(p->m, 0, 2176, 320, 2176, s, end, NULL, NULL, NULL);
+        MapGen_SetLineSpecial(p->m, EXIT_LINE, 0);
+        MapGen_AddWall(p->m, 320, 2176, 320, 0, s, "BROWN1");
+        MapGen_AddWall(p->m, 320, 0, 0, 0, s, "BROWN1");
+
+        MapGen_AddWall(p->m, 0, 2176, 0, 2304, end, "BROWN1");
+        MapGen_AddWall(p->m, 0, 2304, 320, 2304, end, "BROWN1");
+        MapGen_AddWall(p->m, 320, 2304, 320, 2176, end, "BROWN1");
+    }
 
     // Three down each side, staggered, facing back down the corridor. Where
     // exactly is drawn each episode: the task is the corridor, not this one
@@ -379,7 +418,6 @@ static void build_deadly_corridor(plan_t *p)
     MapGen_AddThing(p->m, 160, 96, 0, THING_SHOTGUN, ALL_SKILLS);
     MapGen_AddThing(p->m, 160, 160, 0, THING_SHELLBOX, ALL_SKILLS);
     MapGen_AddThing(p->m, 160, 2240, 0, THING_GREEN_ARMOR, ALL_SKILLS);
-    p->goal_armor = 1;
     p->one_hit_monsters = 1;
     p->freeze_monsters = 1;
 }
@@ -504,7 +542,7 @@ static void build_health_gathering_supreme(plan_t *p)
     int room[64];
     int i;
 
-    build_maze(p, 4, BURNING_FLOOR, "NUKAGE1", tex, 1, room);
+    build_maze(p, 4, BURNING_FLOOR, "NUKAGE1", tex, 1, room, -1);
     i = rng_range(&p->rng, 0, p->nrooms - 1);
     MapGen_AddThing(p->m, p->room_x[i], p->room_y[i],
                     rng_range(&p->rng, 0, 7) * 45, THING_PLAYER, ALL_SKILLS);
@@ -571,8 +609,13 @@ static void build_my_way_home(plan_t *p)
 
     int dist[64], far[64], nfar = 0, best = 0, i;
 
-    build_maze(p, 4, 0, "FLOOR4_8", tex, 16, room);
-    home = rng_range(&p->rng, 0, p->nrooms - 1);
+    // Which room is home has to be settled before the maze is built, because
+    // it is that room's DOORWAYS that end the level - crossing one is what
+    // "got there" means, and a level ends at a line. The maze's shape does
+    // not depend on which room is picked, so nothing is lost by choosing
+    // first.
+    home = rng_range(&p->rng, 0, 15);
+    build_maze(p, 4, 0, "FLOOR4_8", tex, 16, room, home);
 
     // Not next door. A start drawn uniformly lands beside the armour often
     // enough to finish some episodes in three decisions, and an episode that
@@ -598,9 +641,12 @@ static void build_my_way_home(plan_t *p)
 
     MapGen_AddThing(p->m, p->room_x[start], p->room_y[start],
                     rng_range(&p->rng, 0, 7) * 45, THING_PLAYER, ALL_SKILLS);
+    // Still there, and still the thing that makes the room recognisable from
+    // the doorway - but the level now ends at the doorway itself rather than
+    // on picking it up, which is how a DOOM level ends and therefore what the
+    // route can lead to.
     MapGen_AddThing(p->m, p->room_x[home], p->room_y[home], 0,
                     THING_GREEN_ARMOR, ALL_SKILLS);
-    p->goal_armor = 1;
 }
 
 // A rocket launcher, one target far enough away that the rocket takes time to
@@ -1128,11 +1174,6 @@ void Scenario_PerTic(void)
         }
     }
 
-    if (plan.goal_armor && players[consoleplayer].armorpoints > 0)
-    {
-        G_ExitLevel();
-        return;
-    }
     if (plan.kills_to_win > 0 && leveltime > 4 && monsters_alive() == 0)
     {
         G_ExitLevel();
