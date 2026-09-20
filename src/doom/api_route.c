@@ -124,6 +124,9 @@ static unsigned char *seen;
 static int *cell_sector;
 /* How many of the level's lines were on the automap when `seen` was filled. */
 static int seen_from;
+/* The cell the player was in when the field was last flooded. The frontier is
+ * chosen relative to it, so it is half of what the answer depends on. */
+static int flooded_from = -1;
 /* Set when the route leads to unexplored ground rather than to the exit, a
  * key or a switch: the player has not found the way out yet, and looking for
  * it is the job. */
@@ -1820,6 +1823,11 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
         walk[cy * grid_w + cx] = 1;
     }
     mark_seen(probe);
+    {
+        int fx, fy;
+
+        flooded_from = cell_of(probe->x, probe->y, &fx, &fy) ? fy * grid_w + fx : -1;
+    }
     build_ms = I_GetTimeMS();
     build_edges(probe);
     build_ms = I_GetTimeMS() - build_ms;
@@ -1890,6 +1898,11 @@ static void reflood(mobj_t *probe)
     n_spots = API_ExitSpots(probe, spots, API_MAX_EXIT_SPOTS);
     mark_seen(probe);
     seed_and_flood(probe, true, queue, spots, n_spots, 0, &no_seed);
+    {
+        int cx, cy;
+
+        flooded_from = cell_of(probe->x, probe->y, &cx, &cy) ? cy * grid_w + cx : -1;
+    }
 }
 
 /* Whether a shut sector the route was waiting on has since been opened.
@@ -1938,12 +1951,31 @@ static void ensure_built(mobj_t *probe)
     if (field != NULL && !field_stale && built_keys == keys_of(probe)
         && !wanted_sector_opened())
     {
-        /* The grid is current. What the player has SEEN may not be - it grows
-         * every time they look at a wall they have not looked at before - and
-         * that changes where the route leads without changing the level. */
-        if (fair_play && mapped_lines() != seen_from)
-        {
-            reflood(probe);
+        /* The grid is current. What the route LEADS TO may not be: the seen
+         * set grows every time the player looks at a wall they have not
+         * looked at before, and the frontier is chosen as the nearest one to
+         * where the player is standing - so both inputs change as they walk.
+         *
+         * Re-deciding on either is what makes an observation a function of
+         * the world rather than of when it was last asked for. Without the
+         * position half, the same six tics answered differently depending on
+         * whether they were requested in one call or six: the frontier had
+         * been picked from wherever the player happened to be at the last
+         * reflood. Measured on E1M1, two runs identical for 160 decisions and
+         * then not - which is exactly the property a recording needs, since
+         * recording is the thing that asks tic by tic.
+         *
+         * A flood is one pass over an array. The grid build it is split from
+         * is thousands of engine queries. */
+        if (fair_play) {
+            int cx, cy;
+
+            if (mapped_lines() != seen_from
+                || (cell_of(probe->x, probe->y, &cx, &cy)
+                    && cy * grid_w + cx != flooded_from))
+            {
+                reflood(probe);
+            }
         }
         return;
     }
