@@ -1347,6 +1347,7 @@ boolean API_Agent_Lockstep(void)
 api_response_t API_PostEpisode(cJSON *req)
 {
     cJSON *val;
+    int i;
     int episode = gameepisode;
     int map = gamemap;
     int skill = (int)gameskill;
@@ -1420,6 +1421,24 @@ api_response_t API_PostEpisode(cJSON *req)
 
     /* Nothing of the last episode's last decision carries into this one. */
     API_ReleaseControls();
+
+    // Nor anything the player was carrying. An episode that ended in a death
+    // already started clean, because the engine marks a dead player for
+    // rebirth and P_SpawnPlayer acts on it. An episode that ended at the exit
+    // or ran out of decisions did not, so the next one began with the last
+    // one's shotgun, ammunition and armour - and two episodes of the same
+    // level were two different runs.
+    //
+    // G_PlayerReborn, not PST_REBORN: the flag would send G_Ticker down the
+    // respawn path, which reloads the level the player is standing in and
+    // would run before the new episode ever got started.
+    for (i = 0; i < MAXPLAYERS; i++)
+    {
+        if (playeringame[i])
+        {
+            G_PlayerReborn(i);
+        }
+    }
 
     G_DeferedInitNew((skill_t)skill, episode, map);
 

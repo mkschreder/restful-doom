@@ -57,6 +57,7 @@ void G_PlayDemo (char* name);
 void G_TimeDemo (char* name);
 boolean G_CheckDemoStatus (void);
 
+void G_PlayerReborn (int player);
 void G_ExitLevel (void);
 void G_SecretExitLevel (void);
 
