@@ -11,6 +11,7 @@
 #include "api_player_controller.h"
 #include "api_object_controller.h"
 #include "api_route.h"
+#include "api_scenario.h"
 #include "d_player.h"
 #include "doomstat.h"
 #include "g_game.h"
@@ -390,6 +391,10 @@ static cJSON *DescribeLevel(void)
 
     cJSON_AddNumberToObject(o, "episode", gameepisode);
     cJSON_AddNumberToObject(o, "map", gamemap);
+    if (Scenario_Active())
+    {
+        cJSON_AddStringToObject(o, "scenario", Scenario_Current());
+    }
     cJSON_AddNumberToObject(o, "skill", (int)gameskill);
     cJSON_AddNumberToObject(o, "tic", leveltime);
     cJSON_AddNumberToObject(o, "kills", p->killcount);
@@ -1419,6 +1424,39 @@ api_response_t API_PostEpisode(cJSON *req)
         have_pending_seed = true;
     }
 
+    // A scenario is a level this engine builds rather than one it loads, so
+    // it decides which episode and map to start and overrides both. The same
+    // seed shapes it, which is what makes an episode's world its own.
+    val = cJSON_GetObjectItem(req, "scenario");
+    if (val != NULL && cJSON_IsString(val))
+    {
+        unsigned int seed = have_pending_seed ? (unsigned int)pending_seed : 0;
+
+        if (!Scenario_Select(val->valuestring, seed, &episode, &map))
+        {
+            char known[512];
+            int i;
+
+            M_StringCopy(known, "scenario must be one of:", sizeof(known));
+            for (i = 0; i < Scenario_Count(); i++)
+            {
+                M_StringConcat(known, " ", sizeof(known));
+                M_StringConcat(known, Scenario_Name(i), sizeof(known));
+            }
+            return API_CreateErrorResponse(400, known);
+        }
+    }
+    else if (val != NULL && cJSON_IsNull(val))
+    {
+        Scenario_Clear();
+    }
+    else if (cJSON_GetObjectItem(req, "episode") != NULL
+             || cJSON_GetObjectItem(req, "map") != NULL)
+    {
+        // Naming a level is asking for the game's own.
+        Scenario_Clear();
+    }
+
     /* Nothing of the last episode's last decision carries into this one. */
     API_ReleaseControls();
 
@@ -1428,7 +1466,6 @@ api_response_t API_PostEpisode(cJSON *req)
     // or ran out of decisions did not, so the next one began with the last
     // one's shotgun, ammunition and armour - and two episodes of the same
     // level were two different runs.
-    //
     // G_PlayerReborn, not PST_REBORN: the flag would send G_Ticker down the
     // respawn path, which reloads the level the player is standing in and
     // would run before the new episode ever got started.

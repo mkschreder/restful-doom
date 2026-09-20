@@ -31,17 +31,18 @@
 #include "g_game.h"
 
 #include "i_system.h"
+#include "m_misc.h"
 #include "w_wad.h"
 
 #include "doomdef.h"
 #include "p_local.h"
+#include "api_scenario.h"
 
 #include "s_sound.h"
 
 #include "doomstat.h"
 
 
-void	P_SpawnMapThing (mapthing_t*	mthing);
 
 
 //
@@ -784,7 +785,13 @@ P_SetupLevel
     W_Reload ();
 
     // find map name
-    if ( gamemode == commercial)
+    if (Scenario_Active())
+    {
+        // A generated level is not in any episode, so there is no ExMy to
+        // name it by. It is published under its own lump.
+        M_StringCopy(lumpname, Scenario_LumpName(), sizeof(lumpname));
+    }
+    else if ( gamemode == commercial)
     {
 	if (map<10)
 	    DEH_snprintf(lumpname, 9, "map0%i", map);
@@ -842,6 +849,10 @@ P_SetupLevel
 	
     // build subsector connect matrix
     //	UNUSED P_ConnectSubsectors ();
+
+    // A scenario's rules - what respawns, what falls from the sky, what ends
+    // the episode - need the level standing before they can touch it.
+    Scenario_LevelLoaded ();
 
     // preload graphics
     if (precache)

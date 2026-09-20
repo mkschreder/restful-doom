@@ -20,6 +20,7 @@
 
 #include "z_zone.h"
 #include "p_local.h"
+#include "api_scenario.h"
 
 #include "doomstat.h"
 
@@ -147,6 +148,7 @@ void P_Ticker (void)
     P_RunThinkers ();
     P_UpdateSpecials ();
     P_RespawnSpecials ();
+    Scenario_PerTic ();
 
     // for par times
     leveltime++;	
