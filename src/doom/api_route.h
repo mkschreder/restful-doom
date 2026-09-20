@@ -87,6 +87,17 @@ cJSON *API_RouteDebug(mobj_t *player);
 void API_RouteMarkVisited(mobj_t *player);
 void API_RouteForgetVisited(void);
 
+// Throw away everything derived from the level that is standing: the grid,
+// the flood, and how much of the map had been seen when the seen set was
+// last computed.
+//
+// Needed because a restored snapshot puts back a level the route has already
+// built against. The grid IS rebuilt whenever the lines move, but "the lines
+// moved" is detected by comparing a pointer, and a zone allocator that hands
+// back the block it just freed defeats that - which is the one case where
+// the agent would be routed around a map that no longer exists.
+void API_RouteInvalidate(void);
+
 typedef struct {
     int w;
     int h;

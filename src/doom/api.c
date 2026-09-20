@@ -17,6 +17,7 @@
 #include "api_door_controller.h"
 #include "api_object_controller.h"
 #include "api_agent.h"
+#include "api_snapshot.h"
 
 
 extern api_obj_description_t api_descriptors[];
@@ -482,6 +483,22 @@ api_response_t API_RouteRequest(api_request_t req)
         if (strcmp(method, "POST") == 0)
         {
             return API_PostEpisode(json);
+        }
+        return API_CreateErrorResponse(405, "Method not allowed");
+    }
+    else if (strcmp(path, "api/snapshot") == 0)
+    {
+        if (strcmp(method, "POST") == 0)
+        {
+            return API_PostSnapshot(json);
+        }
+        return API_CreateErrorResponse(405, "Method not allowed");
+    }
+    else if (strcmp(path, "api/snapshot/restore") == 0)
+    {
+        if (strcmp(method, "POST") == 0)
+        {
+            return API_PostSnapshotRestore(json);
         }
         return API_CreateErrorResponse(405, "Method not allowed");
     }

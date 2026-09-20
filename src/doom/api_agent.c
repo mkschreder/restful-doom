@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "api_agent.h"
+#include "api_snapshot.h"
 #include "api_player_controller.h"
 #include "api_object_controller.h"
 #include "api_route.h"
@@ -1459,6 +1460,10 @@ api_response_t API_PostEpisode(cJSON *req)
 
     /* Nothing of the last episode's last decision carries into this one. */
     API_ReleaseControls();
+
+    // A snapshot of the episode that just ended would restore into this one,
+    // and the level it archives is not the level that will be standing.
+    API_SnapshotDiscardAll();
 
     // Nor anything the player was carrying. An episode that ended in a death
     // already started clean, because the engine marks a dead player for

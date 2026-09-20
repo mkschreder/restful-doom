@@ -85,6 +85,7 @@ api_agent.c             api_agent.h \
 api_route.c             api_route.h \
 api_mapgen.c            api_mapgen.h \
 api_scenario.c          api_scenario.h \
+api_snapshot.c          api_snapshot.h \
 api_obj_descriptions.c
 
 libdoom_a_SOURCES = $(SOURCE_FILES)                   \

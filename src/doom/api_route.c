@@ -642,6 +642,15 @@ static void mark_seen(mobj_t *probe)
     free(sector_seen);
 }
 
+void API_RouteInvalidate(void)
+{
+    built_for = NULL;
+    built_count = 0;
+    built_keys = -1;
+    seen_from = -1;
+    field_stale = true;
+}
+
 /* Whether the route is allowed to cross this cell at all. */
 static boolean open_to_route(int cell)
 {
