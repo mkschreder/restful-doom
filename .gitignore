@@ -38,3 +38,9 @@ packages
 .#*
 .*.swp
 .DS_store
+
+# Test binaries and automake test-suite output
+*_test
+*.log
+*.trs
+test-suite.log

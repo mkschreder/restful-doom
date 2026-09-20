@@ -83,9 +83,18 @@ api_door_controller.c api_door_controller.h \
 api_object_controller.c api_object_controller.h \
 api_agent.c             api_agent.h \
 api_route.c             api_route.h \
+api_mapgen.c            api_mapgen.h \
 api_obj_descriptions.c
 
 libdoom_a_SOURCES = $(SOURCE_FILES)                   \
                     $(FEATURE_DEHACKED_SOURCE_FILES)  \
                     $(FEATURE_REST_API_SOURCE_FILES)
 
+
+# The node builder compiles geometry into the four lumps a level editor would
+# have produced, and a wrong one does not crash - it puts things in the wrong
+# sector. These checks run without the engine, the WAD or a display.
+check_PROGRAMS = api_mapgen_test
+api_mapgen_test_SOURCES = api_mapgen_test.c api_mapgen.c api_mapgen.h
+api_mapgen_test_LDADD = -lm
+TESTS = $(check_PROGRAMS)
