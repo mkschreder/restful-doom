@@ -86,7 +86,6 @@ api_route.c             api_route.h \
 api_mapgen.c            api_mapgen.h \
 api_scenario.c          api_scenario.h \
 api_snapshot.c          api_snapshot.h \
-api_hud.c               api_hud.h \
 api_obj_descriptions.c
 
 libdoom_a_SOURCES = $(SOURCE_FILES)                   \
@@ -97,14 +96,7 @@ libdoom_a_SOURCES = $(SOURCE_FILES)                   \
 # The node builder compiles geometry into the four lumps a level editor would
 # have produced, and a wrong one does not crash - it puts things in the wrong
 # sector. These checks run without the engine, the WAD or a display.
-check_PROGRAMS = api_mapgen_test api_hud_test
+check_PROGRAMS = api_mapgen_test
 api_mapgen_test_SOURCES = api_mapgen_test.c api_mapgen.c api_mapgen.h
 api_mapgen_test_LDADD = -lm
-
-# The agent overlay is the one place an agent can make the engine draw text it
-# chose, so its store and its line breaker are checked without a WAD or a
-# display.
-api_hud_test_SOURCES = api_hud_test.c api_hud.c api_hud.h api_cJSON.c api_cJSON.h
-api_hud_test_LDADD = -lm
-
 TESTS = $(check_PROGRAMS)

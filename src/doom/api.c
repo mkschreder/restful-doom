@@ -18,7 +18,6 @@
 #include "api_object_controller.h"
 #include "api_agent.h"
 #include "api_snapshot.h"
-#include "api_hud.h"
 
 
 extern api_obj_description_t api_descriptors[];
@@ -542,18 +541,6 @@ api_response_t API_RouteRequest(api_request_t req)
         }
         return API_CreateErrorResponse(405, "Method not allowed");
     }
-    else if (strcmp(path, "api/hud") == 0)
-    {
-        if (strcmp(method, "POST") == 0)
-        {
-            return API_PostHud(json);
-        }
-        if (strcmp(method, "DELETE") == 0)
-        {
-            return API_DeleteHud();
-        }
-        return API_CreateErrorResponse(405, "Method not allowed");
-    }
     else if (strcmp(path, "api/message") == 0)
     {
         if (strcmp(method, "POST") == 0)
@@ -824,11 +811,6 @@ void API_ReleaseControls(void)
         keys_down[i] = -1;
     }
     target_angle = -1;
-
-    // The overlay describes a decision that belonged to the episode being
-    // left behind, so it goes with it rather than hanging over the first
-    // frames of the next one.
-    API_Hud_Clear();
 }
 
 void API_AfterTic()

@@ -123,53 +123,6 @@ baseUri: http://localhost:6666
       400:
         description: Invalid episode, map, skill (0-4) or seed
 
-/api/hud:
-  description: |
-    Overlay text on the rendered frame in the game window: what the model was
-    given and what it decided.
-
-    A policy driving this engine is otherwise invisible. The frames show a
-    player moving and nothing shows what it was told, what it was choosing
-    between, or how close the call was. So the agent pushes that here and the
-    engine draws it on the frame it belongs to.
-
-    A push replaces the overlay wholesale. An empty array draws nothing, and so
-    does DELETE. Each element is an object with a string `text` and an optional
-    boolean `highlight`, or a bare string, which means the same with
-    `highlight` false. Highlighted lines get a red band rather than a black
-    one.
-
-    Long text wraps at word boundaries and is clipped to the player's view, and
-    a list longer than the store keeps its first entries: neither is an error,
-    because a run must not fail over the shape of something only ever drawn.
-
-    The engine gives the text no meaning and never acts on it. Drawing happens
-    in the video path only, so an overlaid run plays out tic for tic like a
-    bare one.
-  post:
-    body:
-      application/json:
-        example: |
-          {
-            "lines": [
-              {"text": "health 100, imp at 320u bearing 41deg"},
-              {"text": "0.71 attack", "highlight": true},
-              {"text": "0.29 turn_left"}
-            ]
-          }
-    responses:
-      204:
-        description: The overlay now shows exactly these lines.
-      400:
-        description: |
-          `lines` missing or not an array, or an element that is neither a
-          string nor an object with a string `text`. The overlay is left as it
-          was.
-  delete:
-    responses:
-      204:
-        description: Nothing is drawn.
-
 /api/frame:
   description: |
     The 320x200 framebuffer the engine just drew, and the palette it would be
