@@ -19,6 +19,7 @@
 #define __HU_STUFF_H__
 
 #include "d_event.h"
+#include "v_patch.h"
 
 
 //
@@ -42,6 +43,10 @@
 //
 // HEADS UP TEXT
 //
+
+// The heads-up font, loaded by HU_Init. Declared here rather than
+// re-declared by each drawer that wants to write text with it.
+extern patch_t *hu_font[HU_FONTSIZE];
 
 void HU_Init(void);
 void HU_Start(void);
