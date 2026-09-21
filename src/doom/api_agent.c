@@ -1365,6 +1365,13 @@ api_response_t API_PostRouteTo(cJSON *req)
              * is already in the observation and is not the same thing. */
             cJSON_AddNumberToObject(r, "pathDistance", route.units);
             cJSON_AddNumberToObject(r, "bearing", rel);
+            /* How far the FIRST leg is. The bearing points at a waypoint a
+             * few cells along, not at the far end, so walking the whole path
+             * distance on this heading walks past the corner it turns at. */
+            cJSON_AddNumberToObject(
+                r, "stepDistance",
+                (int)API_FixedToFloat(P_AproxDistance(player->x - route.x,
+                                                      player->y - route.y)));
             cJSON_AddNumberToObject(r, "clearance", Clearance(player, rel));
         }
         else

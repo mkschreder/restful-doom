@@ -41,6 +41,7 @@
 #include "r_main.h"
 #include "i_timer.h"
 #include "r_state.h"
+#include "m_misc.h"
 
 /* Grid resolution. The player is 32 units wide, so a 64-unit cell is about one
  * of them and a corridor is one or two cells across. */
@@ -74,6 +75,18 @@ static unsigned short *reachable;
  * can no longer disagree. */
 static unsigned char *walk;
 static unsigned char *edges;  /* 8 bits a cell */
+/* The keys that refused a step out of each cell, as a mask of API_KEY_*.
+ *
+ * Kept per cell rather than as one running total, because which keys matter
+ * is a question about the EDGE of what the player can reach: a red door on
+ * the far side of the level is not what is stopping them, and heading for its
+ * key is a worse answer than heading for nothing. The flood is what says
+ * which cells those are, and it has not run when the steps are tested.
+ *
+ * Recorded for both cells of a pair, because a pair is tested once and the
+ * step written in both directions. Approximate in exactly the way the step
+ * itself is, and it stops being approximate when the step does. */
+static unsigned char *locked_at;
 
 /* A one-way jump between two cells that is not a step.
  *
@@ -275,7 +288,6 @@ static boolean line_passable(line_t *ld)
     lock = lock_of(ld);
     if (lock != 0 && !(held_keys & (1 << lock)))
     {
-        keys_wanted |= 1 << lock;
         dropped_locked++;
         return false;
     }
@@ -385,6 +397,13 @@ static boolean walkable(mobj_t *probe, fixed_t x, fixed_t y)
 static divline_t cross_trace;
 static boolean cross_blocked;
 
+/* The line that refused the last crossing test, and the key it wanted.
+ *
+ * "A wall in the way" and "a door you have no key for" look identical from a
+ * grid of heights, and they want completely different things done. */
+static line_t *cross_blocker;
+static int cross_lock;
+
 static boolean PIT_CrossLine(line_t *ld)
 {
     divline_t dl;
@@ -409,6 +428,8 @@ static boolean PIT_CrossLine(line_t *ld)
     if (!line_passable(ld))
     {
         cross_blocked = true;
+        cross_blocker = ld;
+        cross_lock = lock_of(ld);
         return false;
     }
     return true;
@@ -441,6 +462,8 @@ static boolean clear_line(fixed_t x1, fixed_t y1, fixed_t x2, fixed_t y2)
     cross_trace.dx = x2 - x1;
     cross_trace.dy = y2 - y1;
     cross_blocked = false;
+    cross_blocker = NULL;
+    cross_lock = 0;
 
     xl = (lox - bmaporgx) >> MAPBLOCKSHIFT;
     xh = (hix - bmaporgx) >> MAPBLOCKSHIFT;
@@ -983,6 +1006,11 @@ static void build_edges(mobj_t *probe)
             if (!can_cross(cell_x(ax), cell_y(ay), cell_x(nx), cell_y(ny)))
             {
                 dropped_wall++;
+                if (cross_lock != 0)
+                {
+                    locked_at[k] |= 1 << cross_lock;
+                    locked_at[ni] |= 1 << cross_lock;
+                }
                 continue;
             }
             if (!body_fits(probe, (cell_x(ax) + cell_x(nx)) / 2,
@@ -1053,6 +1081,11 @@ static void build_edges(mobj_t *probe)
             if (!can_cross(cell_x(ax), cell_y(ay), cell_x(nx), cell_y(ny)))
             {
                 dropped_wall++;
+                if (cross_lock != 0)
+                {
+                    locked_at[k] |= 1 << cross_lock;
+                    locked_at[ni] |= 1 << cross_lock;
+                }
                 continue;
             }
             if (!body_fits(probe, (cell_x(ax) + cell_x(nx)) / 2,
@@ -1351,13 +1384,42 @@ static void report_fit_path(int *queue)
                 subsector_t *a = R_PointInSubsector(cell_x(ax), cell_y(ay));
                 subsector_t *b = R_PointInSubsector(cell_x(px), cell_y(py));
 
+                boolean walled =
+                    !can_cross(cell_x(ax), cell_y(ay), cell_x(px), cell_y(py));
+                char what[176];
+
+                if (!walled || cross_blocker == NULL)
+                {
+                    M_StringCopy(what, walled ? "a wall in the way"
+                                              : "no room for a body, or a corner cut",
+                                 sizeof(what));
+                }
+                else
+                {
+                    line_t *bl = cross_blocker;
+
+                    P_LineOpening(bl);
+                    M_snprintf(what, sizeof(what),
+                               "line %d, special %d, tag %d%s%s, opening %d, lock %d; "
+                               "back sector %d tag %d floor %d ceiling %d",
+                               (int)(bl - lines), bl->special, bl->tag,
+                               bl->backsector == NULL ? ", one-sided" : "",
+                               (bl->flags & ML_BLOCKING) ? ", flagged blocking" : "",
+                               openrange >> FRACBITS, cross_lock,
+                               bl->backsector == NULL ? -1
+                                   : (int)(bl->backsector - sectors),
+                               bl->backsector == NULL ? 0 : bl->backsector->tag,
+                               bl->backsector == NULL ? 0
+                                   : bl->backsector->floorheight >> FRACBITS,
+                               bl->backsector == NULL ? 0
+                                   : bl->backsector->ceilingheight >> FRACBITS);
+                }
                 printf("API_Route:   %d,%d (floor %d) -> %d,%d (floor %d): %s\n",
                        cell_x(ax) >> FRACBITS, cell_y(ay) >> FRACBITS,
                        a->sector->floorheight >> FRACBITS,
                        cell_x(px) >> FRACBITS, cell_y(py) >> FRACBITS,
                        b->sector->floorheight >> FRACBITS,
-                       !can_cross(cell_x(ax), cell_y(ay), cell_x(px), cell_y(py))
-                           ? "a wall in the way" : "no room for a body, or a corner cut");
+                       what);
                 shown++;
                 missing++;
             }
@@ -1592,7 +1654,6 @@ static boolean seed_and_flood(mobj_t *probe, boolean allow_keys, int *queue,
     int i, cx, cy, seed;
     unsigned short *reach;
 
-    keys_wanted = 0;
     route_goal_key = 0;
     route_goal_switch = false;
     route_goal_frontier = false;
@@ -1663,6 +1724,28 @@ static boolean seed_and_flood(mobj_t *probe, boolean allow_keys, int *queue,
     free(reachable);
     reachable = reach;
     reach = NULL;
+    /* WHICH keys are in the way, read off the edge of what the player can
+     * reach now that the flood has said what that is.
+     *
+     * This was a running total, set while the steps were tested and then
+     * zeroed at the top of this function - one call later, before anything
+     * read it. So the branch below that heads for a key never fired on any
+     * level, and an exit behind a locked door produced no route at all rather
+     * than a route to the key that opens it. */
+    keys_wanted = 0;
+    if (locked_at != NULL)
+    {
+        int c;
+
+        for (c = 0; c < grid_w * grid_h; c++)
+        {
+            if (reachable[c] != ROUTE_UNREACHED)
+            {
+                keys_wanted |= locked_at[c];
+            }
+        }
+    }
+    keys_wanted &= ~held_keys;
     /* The exit is unreachable and a locked door is why: head for its key
      * instead. That is what a player does, and it needs no new machinery -
      * the same field, flooded from a different place. Picking the key up
@@ -1925,7 +2008,6 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
     free(field);
     field = NULL;
     held_keys = keys_of(probe);
-    keys_wanted = 0;
     route_goal_key = 0;
     route_goal_switch = false;
     route_goal_frontier = false;
@@ -1975,8 +2057,10 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
     free(portal_first);
     free(portal_to);
     free(portal_next);
+    free(locked_at);
     walk = calloc(1, grid_w * grid_h);
     edges = calloc(1, grid_w * grid_h);
+    locked_at = calloc(1, grid_w * grid_h);
     visited = calloc(1, grid_w * grid_h);
     seen = calloc(1, grid_w * grid_h);
     cell_sector = malloc(sizeof(int) * grid_w * grid_h);
@@ -1986,7 +2070,7 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
     portal_count = 0;
     if (walk == NULL || edges == NULL || visited == NULL || seen == NULL
         || cell_sector == NULL || portal_first == NULL || portal_to == NULL
-        || portal_next == NULL)
+        || portal_next == NULL || locked_at == NULL)
     {
         printf("API_Route: out of memory for a %dx%d grid\n", grid_w, grid_h);
         free(queue);
