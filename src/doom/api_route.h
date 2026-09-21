@@ -6,6 +6,13 @@
 typedef struct {
     /* Cells of walkable path between the player and the exit, 0 at it. */
     int cells;
+    /* The same path measured in map units, which is not the cell count times
+     * the cell size: a diagonal step crosses one cell and covers about half
+     * again as far, so a path with corners in it is under-reported by up to
+     * two fifths by any count of cells. Only `API_RouteTo`, `API_Frontier`
+     * and `API_DryLand` fill this in; the exit route is a distance field and
+     * reports `cells`. */
+    int units;
     /* Whether there is a next doorway to walk to. */
     boolean have_step;
     fixed_t x;
@@ -130,5 +137,15 @@ boolean API_DryLand(mobj_t *player, api_route_t *out);
 /* The nearest place the player has NOT been, and the way to it. False when
  * every reachable place has been walked. */
 boolean API_Frontier(mobj_t *player, api_route_t *out);
+
+/* The way to a stated place, round whatever is between here and there. False
+ * when there is no walkable path to it.
+ *
+ * The level's own distance field floods from the level's own goal, so it can
+ * only ever answer "which way to the exit". An agent that remembers seeing a
+ * medikit two rooms back has a different question, and without this the only
+ * answer available is a straight line at it - which in a corridor is a
+ * heading into the wall between here and there. */
+boolean API_RouteTo(mobj_t *player, fixed_t x, fixed_t y, api_route_t *out);
 
 #endif

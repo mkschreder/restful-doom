@@ -8,7 +8,14 @@ believes it attacked and nothing happened.
 """
 import json, subprocess, time, urllib.request, os, signal, sys
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 45989
-WAD = "/data/workspace/applications/edgeai/brain/testdata/doom/doom1.wad"
+# The IWAD, which is a resource and is never in this repository. Pass a path,
+# or keep one where the brain workspace does.
+WAD = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "..", "edgeai", "brain", "testdata", "doom", "doom1.wad")
+if not os.path.exists(WAD):
+    print(f"SKIP: no IWAD at {WAD}; pass one as the second argument")
+    sys.exit(0)
 def post(p,b):
     r = urllib.request.Request(f"http://localhost:{PORT}{p}", data=json.dumps(b).encode(),
         headers={"Content-Type":"application/json"}, method="POST")
@@ -34,4 +41,7 @@ try:
           "FAIL: twelve requests to shoot fired nothing")
     sys.exit(0 if ok else 1)
 finally:
-    os.killpg(os.getpgid(eng.pid), signal.SIGTERM)
+    # SIGKILL: the engine does not always go on a polite one, and an engine
+    # left holding the port makes the NEXT run measure a stale world while
+    # reporting it as a fresh one.
+    os.killpg(os.getpgid(eng.pid), signal.SIGKILL)

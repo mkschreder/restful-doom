@@ -527,6 +527,10 @@ api_response_t API_RouteRequest(api_request_t req)
         {
             return API_GetRouteDebug();
         }
+        if (strcmp(method, "POST") == 0)
+        {
+            return API_PostRouteTo(json);
+        }
         return API_CreateErrorResponse(405, "Method not allowed");
     }
     else if (strcmp(path, "api/frame") == 0)

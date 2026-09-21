@@ -1306,6 +1306,76 @@ api_response_t API_GetRouteDebug(void)
     return (api_response_t) {200, root};
 }
 
+/* The way to places the caller names, rather than to the level's own goal.
+ *
+ * The distance field floods from the exit, so everything derived from it
+ * answers one question: which way onward. An agent that has seen a medikit and
+ * walked past it has a different one, and the only answer available without
+ * this is the straight line to where the thing was - which is a heading into
+ * whatever wall stands between here and there. Items are most of what "100% of
+ * the items" asks for, and they are not on the way to the exit.
+ *
+ * Several points per call because a decision asks about all of them at once,
+ * and one round trip beats four.
+ */
+api_response_t API_PostRouteTo(cJSON *req)
+{
+    mobj_t *player = players[consoleplayer].mo;
+    cJSON *to, *point, *root, *routes;
+
+    if (player == NULL)
+    {
+        return API_CreateErrorResponse(404, "no player");
+    }
+    to = cJSON_GetObjectItem(req, "to");
+    if (!cJSON_IsArray(to))
+    {
+        return API_CreateErrorResponse(400, "expected \"to\": a list of {x, y}");
+    }
+    root = cJSON_CreateObject();
+    routes = cJSON_CreateArray();
+    cJSON_AddItemToObject(root, "routes", routes);
+    cJSON_ArrayForEach(point, to)
+    {
+        cJSON *px = cJSON_GetObjectItem(point, "x");
+        cJSON *py = cJSON_GetObjectItem(point, "y");
+        cJSON *r = cJSON_CreateObject();
+        api_route_t route;
+
+        if (!cJSON_IsNumber(px) || !cJSON_IsNumber(py))
+        {
+            cJSON_Delete(root);
+            cJSON_Delete(r);
+            return API_CreateErrorResponse(400, "every point needs a numeric x and y");
+        }
+        if (API_RouteTo(player, API_FloatToFixed(px->valuedouble),
+                        API_FloatToFixed(py->valuedouble), &route)
+            && route.have_step)
+        {
+            angle_t ra = R_PointToAngle2(player->x, player->y, route.x, route.y);
+            int rel = angleToDegrees(ra - player->angle);
+
+            if (rel > 180)
+            {
+                rel -= 360;
+            }
+            cJSON_AddBoolToObject(r, "reachable", true);
+            /* How far the WALK is, which is the number that decides whether
+             * going back for something is worth it. The straight line to it
+             * is already in the observation and is not the same thing. */
+            cJSON_AddNumberToObject(r, "pathDistance", route.units);
+            cJSON_AddNumberToObject(r, "bearing", rel);
+            cJSON_AddNumberToObject(r, "clearance", Clearance(player, rel));
+        }
+        else
+        {
+            cJSON_AddBoolToObject(r, "reachable", false);
+        }
+        cJSON_AddItemToArray(routes, r);
+    }
+    return (api_response_t) {200, root};
+}
+
 api_response_t API_GetMap(void)
 {
     api_map_t map;

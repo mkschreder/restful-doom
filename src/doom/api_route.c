@@ -3122,13 +3122,30 @@ void API_RouteMarkVisited(mobj_t *player)
  *
  * Breadth-first over the grid from where the player stands, crossing anything
  * they fit in, stopping at the first cell whose floor does not hurt. */
-boolean API_DryLand(mobj_t *player, api_route_t *out)
+/* Which cells a search from the player is looking for. */
+typedef boolean (*route_goal_t)(int cell, void *ctx);
+
+/* Breadth-first over the walkable edges from where the player is standing, to
+ * the nearest cell the goal test accepts.
+ *
+ * `lookahead` is where along the path the waypoint sits, counted in cells FROM
+ * THE PLAYER: aiming straight at the far end of a path cuts the corners
+ * through walls, because the bearing to it is a straight line and the path is
+ * not. Negative asks for the goal itself, which is right only when the goal is
+ * near enough that the straight line and the path are the same thing.
+ *
+ * `out->cells` is the whole path's length whatever the waypoint is, because
+ * that is the answer to "how far away is it" and the waypoint is the answer to
+ * "which way do I set off".
+ */
+static boolean route_bfs(mobj_t *player, route_goal_t want, void *ctx,
+                         int lookahead, api_route_t *out)
 {
     int cx, cy, head = 0, tail = 0, found = -1;
     int *queue, *parent;
     int i;
 
-    if (player == NULL || cell_sector == NULL || walk == NULL
+    if (player == NULL || edges == NULL
         || !cell_of(player->x, player->y, &cx, &cy))
     {
         return false;
@@ -3169,7 +3186,7 @@ boolean API_DryLand(mobj_t *player, api_route_t *out)
                 continue;
             }
             parent[ni] = at;
-            if (cell_sector[ni] >= 0 && !hurts(sectors[cell_sector[ni]].special))
+            if (want(ni, ctx))
             {
                 found = ni;
                 break;
@@ -3183,124 +3200,121 @@ boolean API_DryLand(mobj_t *player, api_route_t *out)
         free(parent);
         return false;
     }
-    /* Walk back to the step out of the cell the player is in: the direction
-     * to set off, not the far end of it. */
     {
-        int at = found, steps = 0;
+        int at = found;
+        int n = 0;
+        int step;
+        int *path = malloc(sizeof(int) * grid_w * grid_h);
 
-        while (parent[at] >= 0)
+        if (path == NULL)
         {
-            at = parent[at];
-            steps++;
+            free(queue);
+            free(parent);
+            return false;
         }
-        out->cells = steps;
+        while (at >= 0)
+        {
+            path[n++] = at;
+            at = parent[at];
+        }
+        /* path[0] is the goal and path[n-1] the cell the player is in, so
+         * counting from the player means counting down from the far end. */
+        step = lookahead < 0 ? 0 : n - 1 - lookahead;
+        if (step < 0)
+        {
+            step = 0;
+        }
+        out->cells = n - 1;
+        /* Measured along the path rather than counted in cells: a diagonal
+         * step covers about 1.414 cells of ground and a straight one covers
+         * one, and the difference is what decides whether walking back for
+         * something is worth the trip. */
+        out->units = 0;
+        for (i = 0; i + 1 < n; i++)
+        {
+            int ax = path[i] % grid_w, ay = path[i] / grid_w;
+            int bx = path[i + 1] % grid_w, by = path[i + 1] / grid_w;
+
+            out->units += (ax != bx && ay != by) ? (ROUTE_CELL * 181) / 128 : ROUTE_CELL;
+        }
         out->have_step = true;
-        out->x = cell_x(found % grid_w);
-        out->y = cell_y(found / grid_w);
+        out->x = cell_x(path[step] % grid_w);
+        out->y = cell_y(path[step] / grid_w);
+        free(path);
     }
     free(queue);
     free(parent);
     return true;
 }
 
-boolean API_Frontier(mobj_t *player, api_route_t *out)
+static boolean want_dry(int cell, void *ctx)
 {
-    int cx, cy, head = 0, tail = 0, found = -1;
-    int *queue;
-    int *parent;
-    int i;
+    (void)ctx;
+    return cell_sector[cell] >= 0 && !hurts(sectors[cell_sector[cell]].special);
+}
 
-    if (player == NULL || reachable == NULL || edges == NULL || visited == NULL)
+boolean API_DryLand(mobj_t *player, api_route_t *out)
+{
+    if (cell_sector == NULL || walk == NULL)
     {
         return false;
     }
-    if (!cell_of(player->x, player->y, &cx, &cy)
+    /* Aimed at the dry cell itself: the nearest one is a few cells away at
+     * most, and a player standing in nukage wants the shortest way out of it
+     * rather than a heading. */
+    return route_bfs(player, want_dry, NULL, -1, out);
+}
+
+static boolean want_unvisited(int cell, void *ctx)
+{
+    (void)ctx;
+    return !visited[cell];
+}
+
+boolean API_Frontier(mobj_t *player, api_route_t *out)
+{
+    int cx, cy;
+
+    if (reachable == NULL || visited == NULL
+        || !cell_of(player->x, player->y, &cx, &cy)
         || reachable[cy * grid_w + cx] == ROUTE_UNREACHED)
     {
         return false;
     }
-    queue = malloc(sizeof(int) * grid_w * grid_h);
-    parent = malloc(sizeof(int) * grid_w * grid_h);
-    if (queue == NULL || parent == NULL)
+    return route_bfs(player, want_unvisited, NULL, ROUTE_LOOKAHEAD, out);
+}
+
+static boolean want_cell(int cell, void *ctx)
+{
+    return cell == *(const int *)ctx;
+}
+
+boolean API_RouteTo(mobj_t *player, fixed_t x, fixed_t y, api_route_t *out)
+{
+    int gx, gy, goal;
+
+    if (edges == NULL || !cell_of(x, y, &gx, &gy))
     {
-        free(queue);
-        free(parent);
         return false;
     }
-    for (i = 0; i < grid_w * grid_h; i++)
+    goal = gy * grid_w + gx;
+    /* Standing on it already. A caller asking the way to where it is gets a
+     * path of no cells rather than a failure, which is a different answer
+     * from "there is no way there". */
     {
-        parent[i] = -2;
-    }
-    parent[cy * grid_w + cx] = -1;
-    queue[tail++] = cy * grid_w + cx;
+        int cx, cy;
 
-    while (head < tail && found < 0)
-    {
-        int at = queue[head++];
-        int d;
-
-        for (d = 0; d < 8; d++)
+        if (cell_of(player->x, player->y, &cx, &cy) && cy * grid_w + cx == goal)
         {
-            int nx, ny, ni;
-
-            if (!(edges[at] & (1 << d)))
-            {
-                continue;
-            }
-            nx = at % grid_w + ROUTE_DX[d];
-            ny = at / grid_w + ROUTE_DY[d];
-            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
-            {
-                continue;
-            }
-            ni = ny * grid_w + nx;
-            if (parent[ni] != -2)
-            {
-                continue;
-            }
-            parent[ni] = at;
-            if (!visited[ni])
-            {
-                found = ni;
-                break;
-            }
-            queue[tail++] = ni;
+            out->cells = 0;
+            out->units = 0;
+            out->have_step = true;
+            out->x = cell_x(gx);
+            out->y = cell_y(gy);
+            return true;
         }
     }
-
-    if (found < 0)
-    {
-        free(queue);
-        free(parent);
-        return false;
-    }
-
-    /* Path length, and a waypoint a few steps along it rather than the far
-     * end - aiming at the frontier itself would cut corners through walls. */
-    {
-        int steps = 0;
-        int at = found;
-        int path[4096];
-        int n = 0;
-
-        while (at >= 0 && n < 4096)
-        {
-            path[n++] = at;
-            at = parent[at];
-        }
-        out->cells = n - 1;
-        steps = n - 1 - ROUTE_LOOKAHEAD;
-        if (steps < 0)
-        {
-            steps = 0;
-        }
-        out->have_step = true;
-        out->x = cell_x(path[steps] % grid_w);
-        out->y = cell_y(path[steps] / grid_w);
-    }
-    free(queue);
-    free(parent);
-    return true;
+    return route_bfs(player, want_cell, &goal, ROUTE_LOOKAHEAD, out);
 }
 
 /* The explored map, one byte a cell, for a viewer to draw.

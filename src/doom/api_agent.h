@@ -39,5 +39,6 @@ api_response_t API_PostEpisode(cJSON *req);
 api_response_t API_GetFrame(void);
 api_response_t API_GetMap(void);
 api_response_t API_GetRouteDebug(void);
+api_response_t API_PostRouteTo(cJSON *req);
 
 #endif
