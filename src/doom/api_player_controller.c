@@ -20,6 +20,7 @@ extern int key_right;
 extern int key_left;
 extern int key_up;
 extern int key_down;
+extern int key_fire;
 extern int key_speed;
 extern int key_strafeleft;
 extern int key_straferight;
@@ -210,7 +211,25 @@ api_response_t API_PostPlayerAction(cJSON *req)
     }
     else if (strcmp(type, "shoot") == 0)
     {
-        P_FireWeapon(&players[consoleplayer]);
+        // Hold the FIRE KEY, exactly as every other action here holds its own
+        // key, rather than calling P_FireWeapon directly.
+        //
+        // Calling it directly restarted the weapon's attack state whenever it
+        // was asked, bypassing the whole control path: A_WeaponReady, which
+        // only fires when the weapon has actually returned to ready and which
+        // holds `attackdown` so the rocket launcher and the BFG do not
+        // auto-fire; and A_ReFire, which keeps the refire count that accuracy
+        // depends on. Asked every four tics, that could restart a rocket's
+        // eight-tic wind-up before the missile was ever spawned - a weapon
+        // firing nothing at all, while the agent believed it had attacked.
+        //
+        // Through the key, the state machine decides what a request to shoot
+        // means for the weapon in hand, which is what a player gets.
+        keys_down[key_fire] = amount;
+        event.type = ev_keydown;
+        event.data1 = key_fire;
+        event.data2 = 0;
+        D_PostEvent(&event);
     }
     else 
     {
