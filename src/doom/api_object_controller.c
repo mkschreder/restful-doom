@@ -384,84 +384,108 @@ static mobj_t *BlockingThingAt(mobj_t *self, fixed_t x, fixed_t y)
     return NULL;
 }
 
+boolean API_CanStand(mobj_t *probe, fixed_t x, fixed_t y, fixed_t from_z,
+                     boolean ignore_things, api_stand_t *out)
+{
+    fixed_t ox, oy, oz;
+    boolean fits;
+
+    out->blocker = NULL;
+    out->ok = false;
+    /* P_CheckPosition leaves its scratch state pointing at the thing and can
+     * leave the thing itself moved; the probe must not disturb the game. */
+    ox = probe->x;
+    oy = probe->y;
+    oz = probe->z;
+    fits = ignore_things ? P_CheckPositionLines(probe, x, y)
+                         : P_CheckPosition(probe, x, y);
+    out->floor = tmfloorz;
+    out->ceiling = tmceilingz;
+    out->dropoff = tmdropoffz;
+    probe->x = ox;
+    probe->y = oy;
+    probe->z = oz;
+
+    if (!fits)
+    {
+        if (!ignore_things)
+        {
+            out->blocker = BlockingThingAt(probe, x, y);
+        }
+        out->why = out->blocker != NULL ? "thing" : "wall";
+        return false;
+    }
+    /* The body has to fit between the two surfaces at all. */
+    if (out->ceiling - out->floor < probe->height)
+    {
+        out->why = "does-not-fit";
+        return false;
+    }
+    /* Standing here rather than arriving: the body is on whatever holds it
+     * up, so there is no step and the headroom is measured from the floor it
+     * is standing on. */
+    if (from_z == API_STAND_HERE)
+    {
+        from_z = out->floor;
+    }
+    /* And it has to fit where it is coming from, at the height it is at. */
+    if (out->ceiling - from_z < probe->height)
+    {
+        out->why = "headroom";
+        return false;
+    }
+    if (out->floor - from_z > 24 * FRACUNIT)
+    {
+        out->why = "step-up";
+        return false;
+    }
+    /* The dropoff rule does not apply to everything: `P_TryMove` exempts
+     * anything carrying MF_DROPOFF or MF_FLOAT, and the player carries
+     * MF_DROPOFF, so walking off a ledge is a move a player makes. */
+    if (!(probe->flags & (MF_DROPOFF | MF_FLOAT))
+        && out->floor - out->dropoff > 24 * FRACUNIT)
+    {
+        out->why = "dropoff";
+        return false;
+    }
+    out->why = "ok";
+    out->ok = true;
+    return true;
+}
+
 api_response_t API_GetMoveTest(int id, float x, float y)
 {
-    fixed_t tx, ty, ox, oy, oz;
-    boolean fits;
-    const char *reason = "ok";
-    boolean ok = true;
-    mobj_t *blocker = NULL;
+    fixed_t tx, ty;
     cJSON *root;
+    api_stand_t st;
     mobj_t *obj = FindObjectById(id);
 
     if (!obj)
     {
         return API_CreateErrorResponse(404, "object not found");
     }
-
     tx = API_FloatToFixed(x);
     ty = API_FloatToFixed(y);
-
-    /* P_CheckPosition leaves its scratch state pointing at the thing and can
-     * leave the thing itself moved; the probe must not disturb the game. */
-    ox = obj->x;
-    oy = obj->y;
-    oz = obj->z;
-    fits = P_CheckPosition(obj, tx, ty);
-    obj->x = ox;
-    obj->y = oy;
-    obj->z = oz;
-
-    if (!fits)
-    {
-        ok = false;
-        blocker = BlockingThingAt(obj, tx, ty);
-        reason = blocker ? "thing" : "wall";
-    }
-    else if (tmceilingz - tmfloorz < obj->height)
-    {
-        ok = false;
-        reason = "does-not-fit";
-    }
-    else if (tmceilingz - obj->z < obj->height)
-    {
-        ok = false;
-        reason = "headroom";
-    }
-    else if (tmfloorz - obj->z > 24 * FRACUNIT)
-    {
-        ok = false;
-        reason = "step-up";
-    }
-    /* The dropoff rule does not apply to everything. `P_TryMove` exempts
-     * anything carrying MF_DROPOFF or MF_FLOAT, and the player carries
-     * MF_DROPOFF - walking off a ledge is a move a player makes. Asking this
-     * of the player without the exemption refuses moves the engine itself
-     * allows, which is the worse of the two errors here: it makes a level
-     * look less connected than it is, and there is nothing in the answer to
-     * say the answer is wrong. */
-    else if (!(obj->flags & (MF_DROPOFF | MF_FLOAT))
-             && tmfloorz - tmdropoffz > 24 * FRACUNIT)
-    {
-        ok = false;
-        reason = "dropoff";
-    }
+    /* From where the thing is standing now, and minding what is in the way:
+     * this answers "could I move there", which is a question about the
+     * moment. `API_CanStand` is the same predicate the route's grid is built
+     * from, asked with the other two arguments. */
+    API_CanStand(obj, tx, ty, obj->z, false, &st);
 
     root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", id);
     cJSON_AddNumberToObject(root, "x", x);
     cJSON_AddNumberToObject(root, "y", y);
-    cJSON_AddBoolToObject(root, "ok", ok);
-    cJSON_AddStringToObject(root, "reason", reason);
+    cJSON_AddBoolToObject(root, "ok", st.ok);
+    cJSON_AddStringToObject(root, "reason", st.why);
     cJSON_AddNumberToObject(root, "z", obj->z >> FRACBITS);
-    cJSON_AddNumberToObject(root, "floor", tmfloorz >> FRACBITS);
-    cJSON_AddNumberToObject(root, "ceiling", tmceilingz >> FRACBITS);
-    cJSON_AddNumberToObject(root, "dropoff", tmdropoffz >> FRACBITS);
-    if (blocker)
+    cJSON_AddNumberToObject(root, "floor", st.floor >> FRACBITS);
+    cJSON_AddNumberToObject(root, "ceiling", st.ceiling >> FRACBITS);
+    cJSON_AddNumberToObject(root, "dropoff", st.dropoff >> FRACBITS);
+    if (st.blocker)
     {
-        cJSON_AddNumberToObject(root, "blockedBy", blocker->id);
-        cJSON_AddStringToObject(root, "blockedByType", API_TypeName(blocker));
+        cJSON_AddNumberToObject(root, "blockedBy", st.blocker->id);
+        cJSON_AddStringToObject(root, "blockedByType", API_TypeName(st.blocker));
     }
-
     return (api_response_t) {200, root};
 }

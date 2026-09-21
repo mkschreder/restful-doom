@@ -381,6 +381,23 @@ static boolean walkable(mobj_t *probe, fixed_t x, fixed_t y)
     probe->x = ox;
     probe->y = oy;
     probe->z = oz;
+    /* The lines only, and deliberately: none of the height rules `P_TryMove`
+     * applies afterwards, which `API_CanStand` does apply.
+     *
+     * Not an oversight, and not right either. This grid encodes "the player
+     * will open what is in the way" by being permissive about WHERE a body
+     * can be, and a shut door is a ceiling resting on a floor with no room
+     * for anybody in it. Asking the honest question here deletes every door
+     * in the level: measured, E1M1's reachable component fell from 2933 cells
+     * to 759 and its exit went out of reach, and six of the eight levels that
+     * route somewhere stopped routing anywhere. Allowing the cells that some
+     * linedef can move recovers two of the six and not the rest.
+     *
+     * What it wants is not a stricter cell test but a step that can carry the
+     * condition it depends on - this door, opened - so the planner can say
+     * what has to be true rather than pretend it already is. Until then this
+     * stays the loose test it has always been, and `API_CanStand` is what the
+     * checks outside the planner ask. */
     if (ok && !allow_damage)
     {
         subsector_t *ss = R_PointInSubsector(x, y);
