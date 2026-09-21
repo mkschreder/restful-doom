@@ -56,6 +56,9 @@
  * player is 32 units wide, so anything less samples the line itself and the
  * side test becomes a coin flip. */
 #define PORTAL_STANDOFF 24
+/* The tallest step a player walks up without doing anything else. The
+ * engine's own number, from `P_TryMove`. */
+#define ROUTE_STEP 24
 /* How far to look for the route when the player is standing off it, in cells.
  * Six is about two of the player's own decisions of walking. */
 #define ROUTE_RECOVER 6
@@ -87,6 +90,15 @@ static unsigned char *edges;  /* 8 bits a cell */
  * step written in both directions. Approximate in exactly the way the step
  * itself is, and it stops being approximate when the step does. */
 static unsigned char *locked_at;
+/* The floor that would hold the player up in each cell.
+ *
+ * Not the sector's floor under the cell's centre: a body has a radius, and
+ * what supports it is the highest floor under any part of it. That is what
+ * `P_TryMove` measures a step against, so it is what a step has to be
+ * measured against here. */
+static fixed_t *cell_floor;
+/* Whether each cell sits in a sector the level can move. */
+static unsigned char *cell_moves;
 
 /* A one-way jump between two cells that is not a step.
  *
@@ -214,6 +226,11 @@ static void want_line(line_t *ld)
  * a bug that reads as a working route right up until the player is standing
  * at the door. */
 static int dropped_locked;
+/* Steps refused because the far side is more of a climb than a step. */
+static int dropped_climb;
+/* Steps that are a ride rather than a walk. */
+static int rides;
+static unsigned char *edge_rides;
 
 static int lock_of(line_t *ld)
 {
@@ -717,8 +734,16 @@ static boolean open_to_route(int cell)
     return walk[cell] && (!fair_play || seen == NULL || seen[cell]);
 }
 
-/* Flood fill `out` from `seed`, 4-connected, through walkable cells a player
- * could cross between. Returns how many cells were reached. */
+/* Flood fill `out` from `seed`, through walkable cells a player could cross
+ * between. Returns how many cells were reached.
+ *
+ * `backwards` asks the other question. Forwards from the player gives the
+ * cells the player can GET TO, which is what a reachable set is. A distance
+ * field is seeded at the GOAL and has to give, for every cell, how far it is
+ * to walk from there to the goal - so it has to follow steps that lead
+ * towards the seed, which is the reverse of following steps out of it. The
+ * two are the same thing only while every step exists in both directions,
+ * and that is exactly what stops being true when a drop is a drop. */
 /* Eight directions, orthogonals first so a tie prefers a straight move.
  *
  * FOUR was tried and is not enough. A 4-connected field can only descend in
@@ -726,10 +751,11 @@ static boolean open_to_route(int cell)
  * the player crosses a cell boundary - measured, a route bearing reading -3,
  * 3, 8, 168, 87, 2, 5 on consecutive decisions, which is not something anything
  * can follow. Eight directions give a gradient that turns smoothly. */
+static const int ROUTE_OPPOSITE[8] = { 1, 0, 3, 2, 7, 6, 5, 4 };
 static const int ROUTE_DX[8] = { 1, -1, 0, 0, 1, 1, -1, -1 };
 static const int ROUTE_DY[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
 
-static int flood(unsigned short *out, int seed, int *queue)
+static int flood(unsigned short *out, int seed, int *queue, boolean backwards)
 {
     int head = 0, tail = 0, reached = 1, i;
 
@@ -752,13 +778,20 @@ static int flood(unsigned short *out, int seed, int *queue)
 
         for (d = 0; d < 8; d++)
         {
-            int ni;
+            int nx = ax + ROUTE_DX[d], ny = ay + ROUTE_DY[d], ni;
 
-            if (!(edges[at] & (1 << d)))
+            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
             {
                 continue;
             }
-            ni = (ay + ROUTE_DY[d]) * grid_w + ax + ROUTE_DX[d];
+            ni = ny * grid_w + nx;
+            /* Forwards: is there a step out of here into there. Backwards: is
+             * there a step out of THERE into here. */
+            if (!(backwards ? (edges[ni] & (1 << ROUTE_OPPOSITE[d]))
+                            : (edges[at] & (1 << d))))
+            {
+                continue;
+            }
             if (out[ni] != ROUTE_UNREACHED || !open_to_route(ni))
             {
                 continue;
@@ -774,17 +807,42 @@ static int flood(unsigned short *out, int seed, int *queue)
          * been seen, because the ordinary test applies from there on, so
          * under fair play a route through an unused teleporter reaches the
          * landing spot and stops - which is exactly what is known. */
-        for (d = portal_first[at]; d >= 0; d = portal_next[d])
+        if (!backwards)
         {
-            int ni = portal_to[d];
-
-            if (out[ni] != ROUTE_UNREACHED || !walk[ni])
+            for (d = portal_first[at]; d >= 0; d = portal_next[d])
             {
-                continue;
+                int ni = portal_to[d];
+
+                if (out[ni] != ROUTE_UNREACHED || !walk[ni])
+                {
+                    continue;
+                }
+                out[ni] = out[at] + 1;
+                queue[tail++] = ni;
+                reached++;
             }
-            out[ni] = out[at] + 1;
-            queue[tail++] = ni;
-            reached++;
+        }
+        else
+        {
+            /* Which cells teleport TO here. A jump is one-way by nature, so
+             * there is no reverse index to walk; there are a couple of dozen
+             * of them at most and the scan costs less than keeping one. */
+            for (d = 0; d < grid_w * grid_h; d++)
+            {
+                int j;
+
+                for (j = portal_first[d]; j >= 0; j = portal_next[j])
+                {
+                    if (portal_to[j] != at || out[d] != ROUTE_UNREACHED || !walk[d])
+                    {
+                        continue;
+                    }
+                    out[d] = out[at] + 1;
+                    queue[tail++] = d;
+                    reached++;
+                    break;
+                }
+            }
         }
     }
     return reached;
@@ -825,7 +883,6 @@ static boolean body_fits(mobj_t *probe, fixed_t x, fixed_t y, int d)
 
 /* The direction that undoes each of the eight, so a pair of cells is tested
  * once and the answer written into both. */
-static const int ROUTE_OPPOSITE[8] = { 1, 0, 3, 2, 7, 6, 5, 4 };
 
 /* How many steps survived each test, for the line the build prints. A level
  * whose rooms come out disconnected shows up here as a suspicious number
@@ -986,6 +1043,105 @@ static void build_portals(void)
     }
 }
 
+/* Which sectors some linedef in the level can move, one byte a sector.
+ *
+ * The difference between a ledge and a lift, which from a grid of heights are
+ * the same thing: floor too high to climb. A lift is one something can bring
+ * down - a special on a line that operates it, or a tag some switch or
+ * trigger elsewhere carries. A ledge is one nothing can. */
+static unsigned char *sector_moves;
+
+static boolean sector_moves_at(fixed_t x, fixed_t y)
+{
+    subsector_t *ss = R_PointInSubsector(x, y);
+
+    if (sector_moves == NULL || ss == NULL || ss->sector == NULL)
+    {
+        return false;
+    }
+    return sector_moves[ss->sector - sectors] != 0;
+}
+
+static void build_sector_moves(void)
+{
+    int i, j;
+
+    free(sector_moves);
+    sector_moves = calloc(1, numsectors);
+    if (sector_moves == NULL)
+    {
+        return;
+    }
+    for (i = 0; i < numlines; i++)
+    {
+        line_t *ld = &lines[i];
+
+        if (ld->special == 0)
+        {
+            continue;
+        }
+        /* Operated from the line itself: what moves is the sector behind it.
+         * That is every door and lift a player walks up to and uses. */
+        if (ld->backsector != NULL)
+        {
+            sector_moves[ld->backsector - sectors] = 1;
+        }
+        /* Operated by tag: every sector carrying it moves, and the line that
+         * carries the special can be anywhere in the level. */
+        if (ld->tag != 0)
+        {
+            for (j = 0; j < numsectors; j++)
+            {
+                if (sectors[j].tag == ld->tag)
+                {
+                    sector_moves[j] = 1;
+                }
+            }
+        }
+    }
+}
+
+/* What a step costs a player: nothing, an interaction, or impossible. */
+typedef enum { STEP_WALK, STEP_RIDE, STEP_NO } step_t;
+
+/* Whether the player could take this step, as opposed to whether the two
+ * cells are next to each other with nothing between them.
+ *
+ * Directional, and that is the point. A ledge is a step down one way and a
+ * climb the other, and `P_TryMove` allows the first and refuses the second.
+ * Writing one test into both directions - which this did - meant a legal drop
+ * and an impossible climb had to be the same answer, so the grid either
+ * invented the climb or deleted the drop. It invented the climb: measured on
+ * E1M1, 160 of 1756 claimed steps led up something no player can walk up. */
+static step_t step_fits(int from, int to)
+{
+    if (cell_floor == NULL)
+    {
+        return STEP_WALK;
+    }
+    if (cell_floor[to] - cell_floor[from] <= ROUTE_STEP * FRACUNIT)
+    {
+        return STEP_WALK;
+    }
+    /* Too high to walk up. If either end of the step is something the level
+     * can move, it is a lift and the way on is to ride it - a step the player
+     * takes, just not by walking.
+     *
+     * EITHER end, because a lift is used from both. Stepping ON at the bottom
+     * is a step into the moving sector; stepping OFF at the top is a step out
+     * of it, and at the moment the grid is built the lift is DOWN, so that
+     * one reads as a climb of the whole shaft. Asking only about the
+     * destination lost E1M4's exit.
+     *
+     * The route may plan through it. What it must not do is go on pretending
+     * it is ordinary floor, because the agent has to be told to operate it. */
+    if (cell_moves != NULL && (cell_moves[to] || cell_moves[from]))
+    {
+        return STEP_RIDE;
+    }
+    return STEP_NO;
+}
+
 static void build_edges(mobj_t *probe)
 {
     dropped_locked = 0;
@@ -993,7 +1149,9 @@ static void build_edges(mobj_t *probe)
     int k, d;
 
     kept_straight = kept_diagonal = dropped_wall = dropped_body = 0;
+    dropped_climb = rides = 0;
     memset(edges, 0, grid_w * grid_h);
+    memset(edge_rides, 0, grid_w * grid_h);
 
     for (k = 0; k < grid_w * grid_h; k++)
     {
@@ -1003,15 +1161,15 @@ static void build_edges(mobj_t *probe)
         {
             continue;
         }
-        /* +x and +y only: -x and -y are the same pairs seen from the other
-         * end, and crossing is symmetric. */
-        for (d = 0; d < 4; d += 2)
+        /* All four, not two mirrored: whether the LINES allow the crossing is
+         * symmetric, but whether the player can take the step is not. */
+        for (d = 0; d < 4; d++)
         {
             int nx = ax + ROUTE_DX[d];
             int ny = ay + ROUTE_DY[d];
             int ni;
 
-            if (nx >= grid_w || ny >= grid_h)
+            if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h)
             {
                 continue;
             }
@@ -1036,8 +1194,19 @@ static void build_edges(mobj_t *probe)
                 dropped_body++;
                 continue;
             }
+            switch (step_fits(k, ni))
+            {
+                case STEP_NO:
+                    dropped_climb++;
+                    continue;
+                case STEP_RIDE:
+                    edge_rides[k] |= 1 << d;
+                    rides++;
+                    break;
+                case STEP_WALK:
+                    break;
+            }
             edges[k] |= 1 << d;
-            edges[ni] |= 1 << ROUTE_OPPOSITE[d];
             kept_straight++;
         }
     }
@@ -1050,10 +1219,7 @@ static void build_edges(mobj_t *probe)
         {
             continue;
         }
-        /* Two of the four, mirrored, for the same reason as the straights,
-         * and here it is not just an economy - see the symmetry check at the
-         * end of the build for what asking twice cost. */
-        for (d = 4; d < 6; d++)
+        for (d = 4; d < 8; d++)
         {
             int nx = ax + ROUTE_DX[d];
             int ny = ay + ROUTE_DY[d];
@@ -1111,8 +1277,19 @@ static void build_edges(mobj_t *probe)
                 dropped_body++;
                 continue;
             }
+            switch (step_fits(k, ni))
+            {
+                case STEP_NO:
+                    dropped_climb++;
+                    continue;
+                case STEP_RIDE:
+                    edge_rides[k] |= 1 << d;
+                    rides++;
+                    break;
+                case STEP_WALK:
+                    break;
+            }
             edges[k] |= 1 << d;
-            edges[ni] |= 1 << ROUTE_OPPOSITE[d];
             kept_diagonal++;
         }
     }
@@ -1719,7 +1896,7 @@ static boolean seed_and_flood(mobj_t *probe, boolean allow_keys, int *queue,
         field = NULL;
         return false;
     }
-    flood(reach, cy * grid_w + cx, queue);
+    flood(reach, cy * grid_w + cx, queue, false);
 
     /* The first candidate spot at the exit that the player can reach. */
     seed = -1;
@@ -1816,7 +1993,8 @@ static boolean seed_and_flood(mobj_t *probe, boolean allow_keys, int *queue,
         }
         if (island != NULL && exit_cell >= 0)
         {
-            flood(island, exit_cell, queue);
+            /* Which cells can get TO the exit, not which the exit leads to. */
+            flood(island, exit_cell, queue, true);
         }
         for (w = 0; w < wanted_count && seed < 0; w++)
         {
@@ -1954,7 +2132,7 @@ static boolean seed_and_flood(mobj_t *probe, boolean allow_keys, int *queue,
 
             if (cell_of(spots[i].x, spots[i].y, &sx, &sy) && walk[sy * grid_w + sx])
             {
-                int got = flood(field, sy * grid_w + sx, queue);
+                int got = flood(field, sy * grid_w + sx, queue, true);
 
                 printf("API_Route: the exit's own side of the level is %d cells\n", got);
                 report_boundary(probe, queue);
@@ -1986,7 +2164,7 @@ static boolean seed_and_flood(mobj_t *probe, boolean allow_keys, int *queue,
         /* Sequenced deliberately: C does not order function arguments, and
          * reading the field in the same printf that fills it reported the
          * spawn as unreachable on a field that had not been built yet. */
-        int got = flood(field, seed, queue);
+        int got = flood(field, seed, queue, true);
         int at_spawn = field[cy * grid_w + cx];
 
         static const char *colour_name[] = { "", "blue", "yellow", "red" };
@@ -2075,7 +2253,13 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
     free(portal_to);
     free(portal_next);
     free(locked_at);
+    free(cell_floor);
+    free(edge_rides);
+    free(cell_moves);
     walk = calloc(1, grid_w * grid_h);
+    edge_rides = calloc(1, grid_w * grid_h);
+    cell_moves = calloc(1, grid_w * grid_h);
+    cell_floor = malloc(sizeof(fixed_t) * grid_w * grid_h);
     edges = calloc(1, grid_w * grid_h);
     locked_at = calloc(1, grid_w * grid_h);
     visited = calloc(1, grid_w * grid_h);
@@ -2087,7 +2271,8 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
     portal_count = 0;
     if (walk == NULL || edges == NULL || visited == NULL || seen == NULL
         || cell_sector == NULL || portal_first == NULL || portal_to == NULL
-        || portal_next == NULL || locked_at == NULL)
+        || portal_next == NULL || locked_at == NULL || cell_floor == NULL
+        || edge_rides == NULL || cell_moves == NULL)
     {
         printf("API_Route: out of memory for a %dx%d grid\n", grid_w, grid_h);
         free(queue);
@@ -2095,12 +2280,35 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
         field = NULL;
         return false;
     }
+    /* What the level can move, before anything asks whether a cell is a lift. */
+    build_sector_moves();
     for (i = 0; i < grid_w * grid_h; i++)
     {
         subsector_t *ss;
 
         field[i] = ROUTE_UNREACHED;
         walk[i] = walkable(probe, cell_x(i % grid_w), cell_y(i / grid_w)) ? 1 : 0;
+        /* What actually holds the player up here: a body has a radius, and
+         * the floor under it is the highest one any part of it is over, which
+         * is what `P_TryMove` measures a step against. A shut door has an
+         * ordinary floor under its closed ceiling, so this is well defined
+         * there even though no body fits.
+         *
+         * The centre cell's own sector floor was tried instead, to stop a
+         * corridor cell beside a ledge reading as raised. It is wrong in the
+         * other direction - a body standing there really is held up by the
+         * ledge - and it cost a level that this answer keeps. Where the truth
+         * sits between the two is a question about a grid this coarse, not
+         * about the rule. */
+        {
+            api_stand_t st;
+
+            API_CanStand(probe, cell_x(i % grid_w), cell_y(i / grid_w),
+                         API_STAND_HERE, true, &st);
+            cell_floor[i] = st.floor;
+        }
+        cell_moves[i] =
+            sector_moves_at(cell_x(i % grid_w), cell_y(i / grid_w)) ? 1 : 0;
         /* Which sector each cell is in, looked up once. What the player has
          * SEEN changes every few decisions and is decided from this. */
         ss = R_PointInSubsector(cell_x(i % grid_w), cell_y(i / grid_w));
@@ -2127,16 +2335,17 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
     build_edges(probe);
     build_portals();
     build_ms = I_GetTimeMS() - build_ms;
-    /* Every step has to exist from both ends. A traverse between two points
-     * is not bit-for-bit the same run in reverse, so asking the question from
-     * each end and believing both answers produced 128 one-way steps on E1M1
-     * - and a breadth-first field over a graph like that has local minima, a
-     * cell one step further from the exit than its neighbour with no step to
-     * it. The descent stops dead and the agent is told there is no route at
-     * all. Both directions are written from one test now; this is what says
-     * so, and it costs one pass over the grid. */
+    /* How many steps go one way only.
+     *
+     * This used to be checked as a FAULT, and both directions were written
+     * from one test so that it could never happen. That was the wrong cure:
+     * a ledge really is a step down one way and a climb the other, and the
+     * complaint it was guarding against - a distance field with local minima
+     * a descent cannot escape - came from flooding the field forwards out of
+     * the goal. The field is flooded over reverse adjacency now, so a one-way
+     * step is described rather than prevented. */
     {
-        int bad = 0, k2, d2;
+        int oneway = 0, k2, d2;
 
         for (k2 = 0; k2 < grid_w * grid_h; k2++)
         {
@@ -2153,19 +2362,21 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
                 if (nx2 < 0 || ny2 < 0 || nx2 >= grid_w || ny2 >= grid_h
                     || !(edges[ny2 * grid_w + nx2] & (1 << ROUTE_OPPOSITE[d2])))
                 {
-                    bad++;
+                    oneway++;
                 }
             }
         }
-        if (bad > 0)
+        if (oneway > 0)
         {
-            printf("API_Route: %d steps exist one way and not the other - the field "
-                   "will have dead ends in it\n", bad);
+            printf("API_Route: %d steps go one way only - drops the player can "
+                   "take and not take back\n", oneway);
         }
     }
     printf("API_Route: %d straight steps and %d diagonal ones; %d dropped by a wall, "
-           "%d for no room for a body, %d for want of a key\n",
-           kept_straight, kept_diagonal, dropped_wall, dropped_body, dropped_locked);
+           "%d for no room for a body, %d for want of a key, %d too high to climb; "
+           "%d of the steps kept are rides rather than walks\n",
+           kept_straight, kept_diagonal, dropped_wall, dropped_body, dropped_locked,
+           dropped_climb, rides);
 
     return seed_and_flood(probe, allow_keys, queue, spots, n_spots, build_ms, no_seed);
 
