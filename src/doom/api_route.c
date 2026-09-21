@@ -562,6 +562,61 @@ static int cell_of(fixed_t x, fixed_t y, int *cx, int *cy)
  * sides, and the far side of an exit switch can be a void pocket that passes a
  * position check while being sealed off from the level. Which of these is the
  * real one is a question about reachability, answered by the caller. */
+/* Standing spots in any sector whose special ENDS the level.
+ *
+ * Not every level is left through a door. E1M8 has no exit linedef at all:
+ * its two barons die, `A_BossDeath` drops the floor tagged 666, and the room
+ * beyond carries sector special 11 - "damage and end level" - so the way out
+ * is a place to walk into rather than a switch to press. A planner that
+ * searched only for exit LINES found nothing there and gave up before it had
+ * built anything, which is why that level had no route of any kind.
+ *
+ * Sampled on the subsector centres of the sector, which is where a body can
+ * be if anywhere in it can. */
+static int exit_sector_spots(mobj_t *probe, api_point_t *out, int max, int n)
+{
+    int i;
+
+    for (i = 0; i < numsubsectors && n < max; i++)
+    {
+        subsector_t *ss = &subsectors[i];
+        fixed_t cx = 0, cy = 0;
+        int j;
+
+        if (ss->sector == NULL || ss->sector->special != 11 || ss->numlines <= 0)
+        {
+            continue;
+        }
+        for (j = 0; j < ss->numlines; j++)
+        {
+            cx += segs[ss->firstline + j].v1->x / ss->numlines;
+            cy += segs[ss->firstline + j].v1->y / ss->numlines;
+        }
+        /* Asked without the no-damage rule, whatever rule the rest of the
+         * build is using. Special 11 IS a damaging floor - it takes twenty
+         * percent a second and ends the level - so the route's preference for
+         * staying dry refuses the one place the level is trying to send the
+         * player. Somewhere that hurts is still somewhere to go when going
+         * there is what finishing means. */
+        {
+            boolean dry = allow_damage;
+            boolean fits;
+
+            allow_damage = true;
+            fits = walkable(probe, cx, cy);
+            allow_damage = dry;
+            if (!fits)
+            {
+                continue;
+            }
+        }
+        out[n].x = cx;
+        out[n].y = cy;
+        n++;
+    }
+    return n;
+}
+
 int API_ExitSpots(mobj_t *probe, api_point_t *out, int max)
 {
     static const int offsets[] = { 32, 56, 80, 112, 144, 192 };
@@ -577,6 +632,11 @@ int API_ExitSpots(mobj_t *probe, api_point_t *out, int max)
      * slime at decision 58. */
     boolean secret;
 
+    n = exit_sector_spots(probe, out, max, n);
+    if (n > 0)
+    {
+        return n;
+    }
     for (secret = false; secret <= true && n == 0; secret++)
     {
     for (i = 0; i < numlines && n < max; i++)
@@ -3109,7 +3169,7 @@ boolean API_Route(mobj_t *player, api_route_t *out)
 
         for (steps = 0; steps < ROUTE_LOOKAHEAD; steps++)
         {
-            int bn = -1, d;
+            int bn = -1, bd = -1, d;
 
             for (d = 0; d < 8; d++)
             {
@@ -3127,11 +3187,22 @@ boolean API_Route(mobj_t *player, api_route_t *out)
                 if (bn < 0 || field[ni] < field[bn])
                 {
                     bn = ni;
+                    bd = d;
                 }
             }
             if (bn < 0 || field[bn] >= field[py * grid_w + px])
             {
                 break;
+            }
+            /* Whether the FIRST step of the route is one the player has to
+             * operate rather than walk. Only the first: what has to be done
+             * three cells further on is not a decision yet, and saying it
+             * would put a lift in front of an agent standing nowhere near
+             * one. */
+            if (first < 0 && bd >= 0)
+            {
+                out->step_is_ride =
+                    (edge_rides[py * grid_w + px] & (1 << bd)) != 0;
             }
             px = bn % grid_w;
             py = bn / grid_w;

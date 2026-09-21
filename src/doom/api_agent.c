@@ -1074,6 +1074,14 @@ static void DescribeExit(cJSON *root)
                         (int)API_FixedToFloat(P_AproxDistance(player->x - route.x,
                                                               player->y - route.y)));
                     cJSON_AddNumberToObject(o, "routeClearance", Clearance(player, rrel));
+                    /* And whether that step is one to operate rather than
+                     * walk. A lift is the one place where standing still is
+                     * progress, and an agent told only "walk that way" holds
+                     * forward against a wall that was about to come down. */
+                    if (route.step_is_ride)
+                    {
+                        cJSON_AddBoolToObject(o, "routeIsLift", true);
+                    }
                 }
                 // What is in the way, when the route says one thing and the
                 // player's body says another. Almost always a shut door: the

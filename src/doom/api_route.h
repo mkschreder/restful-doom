@@ -15,6 +15,13 @@ typedef struct {
     int units;
     /* Whether there is a next doorway to walk to. */
     boolean have_step;
+    /* Whether that next step is one the player RIDES rather than walks: the
+     * floor beyond it is higher than a player can climb, and something in the
+     * level moves it. A lift, in other words, and the way on is to operate it
+     * and wait - which is the one situation where standing still is progress,
+     * and where an agent told only "walk that way" stands pressing forward
+     * against a wall that was going to come down for it. */
+    boolean step_is_ride;
     fixed_t x;
     fixed_t y;
     /* What stands between the player and that next step, when something does.
