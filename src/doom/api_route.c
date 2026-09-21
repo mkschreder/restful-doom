@@ -2327,6 +2327,9 @@ static void ensure_built(mobj_t *probe)
  * is perfectly stable and points at a wall - measured, eighteen consecutive
  * decisions walking forward at a bearing of -1 without moving. */
 static fixed_t walk_probe_z;
+/* Whether the thing being probed may walk off a ledge. The player may: it
+ * carries MF_DROPOFF and `P_TryMove` exempts it. */
+static boolean walk_probe_drops;
 static boolean walk_blocked;
 static line_t *walk_block_line;
 static fixed_t walk_block_frac;
@@ -2348,12 +2351,12 @@ static boolean PTR_WalkTraverse(intercept_t *in)
      * still refused here: the route may go through it, but the player cannot
      * walk to a point beyond it until it is open.
      *
-     * The third test is the drop on the far side, and it is what makes a
-     * WINDOW a window rather than a doorway: low enough to climb, open above,
-     * and P_TryMove refuses anyway because the player would be standing over
-     * a fall of more than 24 units. */
+     * The third test is the drop on the far side. It applies to a monster and
+     * NOT to the player: `P_TryMove` exempts anything carrying MF_DROPOFF,
+     * and the player carries it, so walking off a ledge is a move a player
+     * makes. Applied to the player it refused moves the engine allows. */
     if (openrange < 56 * FRACUNIT || openbottom - walk_probe_z > 24 * FRACUNIT
-        || openbottom - lowfloor > 24 * FRACUNIT)
+        || (!walk_probe_drops && openbottom - lowfloor > 24 * FRACUNIT))
     {
         walk_blocked = true;
         walk_block_line = ld;
@@ -2414,6 +2417,7 @@ static boolean can_walk_to(mobj_t *player, fixed_t x, fixed_t y)
     walk_blocked = false;
     walk_block_line = NULL;
     walk_probe_z = player->z;
+    walk_probe_drops = (player->flags & (MF_DROPOFF | MF_FLOAT)) != 0;
     P_PathTraverse(player->x, player->y, x, y, PT_ADDLINES, PTR_WalkTraverse);
     if (walk_blocked)
     {

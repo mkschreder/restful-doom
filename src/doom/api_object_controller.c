@@ -433,7 +433,15 @@ api_response_t API_GetMoveTest(int id, float x, float y)
         ok = false;
         reason = "step-up";
     }
-    else if (tmfloorz - tmdropoffz > 24 * FRACUNIT)
+    /* The dropoff rule does not apply to everything. `P_TryMove` exempts
+     * anything carrying MF_DROPOFF or MF_FLOAT, and the player carries
+     * MF_DROPOFF - walking off a ledge is a move a player makes. Asking this
+     * of the player without the exemption refuses moves the engine itself
+     * allows, which is the worse of the two errors here: it makes a level
+     * look less connected than it is, and there is nothing in the answer to
+     * say the answer is wrong. */
+    else if (!(obj->flags & (MF_DROPOFF | MF_FLOAT))
+             && tmfloorz - tmdropoffz > 24 * FRACUNIT)
     {
         ok = false;
         reason = "dropoff";
