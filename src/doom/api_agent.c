@@ -220,6 +220,25 @@ static const char *weapon_names[NUMWEAPONS] =
     "fist", "pistol", "shotgun", "chaingun", "rocket launcher",
     "plasma rifle", "bfg", "chainsaw", "super shotgun"
 };
+// Which number key selects each weapon. Not the weapon's own index: the fist
+// and the chainsaw share key 1, and both shotguns share key 3.
+static int weapon_slot(int weapon)
+{
+    switch (weapon)
+    {
+        case wp_fist:          return 1;
+        case wp_chainsaw:      return 1;
+        case wp_pistol:        return 2;
+        case wp_shotgun:       return 3;
+        case wp_supershotgun:  return 3;
+        case wp_chaingun:      return 4;
+        case wp_missile:       return 5;
+        case wp_plasma:        return 6;
+        case wp_bfg:           return 7;
+        default:               return 2;
+    }
+}
+
 static const char *card_names[NUMCARDS] =
 {
     "blue keycard", "yellow keycard", "red keycard",
@@ -413,6 +432,7 @@ static cJSON *DescribeAgentPlayer(void)
     mobj_t *mo = p->mo;
     cJSON *o = cJSON_CreateObject();
     cJSON *keys;
+    cJSON *weapons;
     int i;
     int weapon = (int)p->readyweapon;
 
@@ -468,6 +488,37 @@ static cJSON *DescribeAgentPlayer(void)
                                               ? p->ammo[weaponinfo[weapon].ammo]
                                               : -1);
     }
+    // Every weapon the player is carrying, with the ammo that feeds it and
+    // the key that selects it.
+    //
+    // A player can see their whole arsenal and pick from it; an agent told
+    // only what it is holding right now cannot choose a shotgun over a pistol
+    // and cannot go back to one once a pickup has switched it away. The
+    // engine has taken a `switch-weapon` action all along - what was missing
+    // was any way to know what there was to switch TO, which made the action
+    // unusable and left every fight to whatever the last pickup happened to
+    // leave in hand.
+    //
+    // The slot is the number key, not the weapon's index: DOOM puts the fist
+    // and the chainsaw on 1 and both shotguns on 3, so a caller that assumed
+    // one per key would ask for the wrong gun.
+    weapons = cJSON_CreateArray();
+    for (i = 0; i < NUMWEAPONS; i++)
+    {
+        if (p->weaponowned[i])
+        {
+            cJSON *w = cJSON_CreateObject();
+
+            cJSON_AddStringToObject(w, "name", weapon_names[i]);
+            cJSON_AddNumberToObject(w, "slot", weapon_slot(i));
+            cJSON_AddNumberToObject(w, "ammo", weaponinfo[i].ammo < NUMAMMO
+                                                   ? p->ammo[weaponinfo[i].ammo]
+                                                   : -1);
+            cJSON_AddItemToArray(weapons, w);
+        }
+    }
+    cJSON_AddItemToObject(o, "weapons", weapons);
+
     keys = cJSON_CreateArray();
     for (i = 0; i < NUMCARDS; i++)
     {
