@@ -20,6 +20,7 @@ extern int key_right;
 extern int key_left;
 extern int key_up;
 extern int key_down;
+extern int key_speed;
 extern int key_strafeleft;
 extern int key_straferight;
 extern int consoleplayer;
@@ -142,6 +143,22 @@ api_response_t API_PostPlayerAction(cJSON *req)
         keys_down[key_straferight] = amount;
         event.type = ev_keydown;
         event.data1 = key_straferight;
+        event.data2 = 0;
+        D_PostEvent(&event);
+    }
+    else if (strcmp(type, "run") == 0)
+    {
+        // DOOM's speed key. Held alongside a movement key it selects the
+        // second entry of forwardmove/sidemove - 0x32 against 0x19, twice the
+        // ground per tic - and it is how a player crosses a level and how
+        // they get out of the way of a projectile. Every human plays on it.
+        //
+        // A modifier rather than a movement of its own: it does nothing by
+        // itself, so it is sent in the same actions array as the forward or
+        // strafe it applies to.
+        keys_down[key_speed] = amount;
+        event.type = ev_keydown;
+        event.data1 = key_speed;
         event.data2 = 0;
         D_PostEvent(&event);
     }
