@@ -36,4 +36,14 @@ int P_Random (void);
 void M_ClearRandom (void);
 
 
+
+// The gameplay and presentation RNG cursors.
+//
+// Exposed so that a simulation checkpoint can put them back: a restore has to
+// call G_InitNew to stand the level up, G_InitNew calls M_ClearRandom, and a
+// counterfactual that re-seeds the dice is not returning to the state it
+// claims to. See api_snapshot.c.
+extern int rndindex;
+extern int prndindex;
+
 #endif

@@ -486,6 +486,17 @@ api_response_t API_RouteRequest(api_request_t req)
         }
         return API_CreateErrorResponse(405, "Method not allowed");
     }
+    else if (strcmp(path, "api/sim") == 0)
+    {
+        // Simulation internals, for the conformance suite. Not in
+        // /api/state: that schema rejects unknown fields, and none of this is
+        // anything a player could see.
+        if (strcmp(method, "GET") == 0)
+        {
+            return API_GetSim();
+        }
+        return API_CreateErrorResponse(405, "Method not allowed");
+    }
     else if (strcmp(path, "api/snapshot") == 0)
     {
         if (strcmp(method, "POST") == 0)
