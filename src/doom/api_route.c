@@ -51,6 +51,10 @@
  * between neighbours as the player crosses a boundary - and too far cuts
  * corners through walls. Four cells is about one decision of walking. */
 #define ROUTE_LOOKAHEAD 4
+/* How far off a teleport line the cell that steps across it is sampled. A
+ * player is 32 units wide, so anything less samples the line itself and the
+ * side test becomes a coin flip. */
+#define PORTAL_STANDOFF 24
 /* How far to look for the route when the player is standing off it, in cells.
  * Six is about two of the player's own decisions of walking. */
 #define ROUTE_RECOVER 6
@@ -70,6 +74,22 @@ static unsigned short *reachable;
  * can no longer disagree. */
 static unsigned char *walk;
 static unsigned char *edges;  /* 8 bits a cell */
+
+/* A one-way jump between two cells that is not a step.
+ *
+ * A teleport linedef moves the player instantly, and the grid is geometry: the
+ * two cells either side of one are as far apart as the level is wide. Without
+ * these the route can never AIM at a teleporter as a way of getting anywhere,
+ * which from E1M5 onward is how a good deal of the shareware episode is meant
+ * to be crossed.
+ *
+ * `portal_first[cell]` indexes `portal_to`, and `portal_next` chains the rest,
+ * because the flood asks "what can I reach from here" once per cell and
+ * scanning a list every time is the flood's inner loop. */
+static int *portal_first;
+static int *portal_to;
+static int *portal_next;
+static int portal_count;
 /* Where the player has been this episode. */
 static unsigned char *visited;
 static int grid_w, grid_h;
@@ -707,6 +727,25 @@ static int flood(unsigned short *out, int seed, int *queue)
             queue[tail++] = ni;
             reached++;
         }
+        /* And whatever this cell teleports to. The destination is entered
+         * without being crossed to, so it is admitted whether or not the
+         * player has seen it: stepping on a pad is something a player can do
+         * knowing only that it is a pad. What lies PAST it still has to have
+         * been seen, because the ordinary test applies from there on, so
+         * under fair play a route through an unused teleporter reaches the
+         * landing spot and stops - which is exactly what is known. */
+        for (d = portal_first[at]; d >= 0; d = portal_next[d])
+        {
+            int ni = portal_to[d];
+
+            if (out[ni] != ROUTE_UNREACHED || !walk[ni])
+            {
+                continue;
+            }
+            out[ni] = out[at] + 1;
+            queue[tail++] = ni;
+            reached++;
+        }
     }
     return reached;
 }
@@ -769,6 +808,144 @@ static int kept_straight, kept_diagonal, dropped_wall, dropped_body;
  *
  * Either way round and not both: a corridor running diagonally has one of its
  * two legs in a wall at every step along it. */
+/* Where a teleport line with this tag puts the player, if anywhere.
+ *
+ * The same search the engine itself does when the line is crossed - the
+ * sectors carrying the tag, and the teleport destination standing in one of
+ * them - so the route and the game agree about where a pad leads. */
+static boolean teleport_target(int tag, fixed_t *tx, fixed_t *ty)
+{
+    int i;
+
+    for (i = 0; i < numsectors; i++)
+    {
+        thinker_t *thinker;
+
+        if (sectors[i].tag != tag)
+        {
+            continue;
+        }
+        for (thinker = thinkercap.next; thinker != &thinkercap;
+             thinker = thinker->next)
+        {
+            mobj_t *m = (mobj_t *)thinker;
+
+            if (thinker->function.acp1 != (actionf_p1)P_MobjThinker
+                || m->type != MT_TELEPORTMAN
+                || m->subsector->sector - sectors != i)
+            {
+                continue;
+            }
+            *tx = m->x;
+            *ty = m->y;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void add_portal(int from, int to)
+{
+    int i;
+
+    if (from == to || portal_count >= grid_w * grid_h)
+    {
+        return;
+    }
+    /* A line crosses many cells and every one of them leads to the same
+     * place, so the same pair arrives over and over. */
+    for (i = portal_first[from]; i >= 0; i = portal_next[i])
+    {
+        if (portal_to[i] == to)
+        {
+            return;
+        }
+    }
+    portal_to[portal_count] = to;
+    portal_next[portal_count] = portal_first[from];
+    portal_first[from] = portal_count;
+    portal_count++;
+}
+
+/* Every cell from which stepping forward crosses a teleport line, joined to
+ * the cell the player lands in.
+ *
+ * Only the FRONT side: the engine refuses a teleport entered from the back,
+ * which is what lets a player walk off a pad they have just arrived on, and a
+ * route that did not know that would send them back and forth forever.
+ *
+ * Only the specials a PLAYER can cross. The monster-only ones move monsters
+ * and would be a route the player cannot walk. */
+static void build_portals(void)
+{
+    int i, lines_seen = 0, lines_resolved = 0;
+
+    portal_count = 0;
+    for (i = 0; i < grid_w * grid_h; i++)
+    {
+        portal_first[i] = -1;
+    }
+    for (i = 0; i < numlines; i++)
+    {
+        line_t *ld = &lines[i];
+        fixed_t tx, ty, dx, dy, ox, oy;
+        int gx, gy, dest, steps, k;
+        fixed_t len;
+
+        if (ld->special != 39 && ld->special != 97)
+        {
+            continue;
+        }
+        lines_seen++;
+        if (!teleport_target(ld->tag, &tx, &ty)
+            || !cell_of(tx, ty, &gx, &gy))
+        {
+            continue;
+        }
+        lines_resolved++;
+        dest = gy * grid_w + gx;
+        dx = ld->v2->x - ld->v1->x;
+        dy = ld->v2->y - ld->v1->y;
+        len = P_AproxDistance(dx, dy);
+        if (len <= 0)
+        {
+            continue;
+        }
+        steps = len / FRACUNIT / (ROUTE_CELL / 2) + 1;
+        /* (dy, -dx) normalised and taken out a body's width, which puts the
+         * sample clear of the line rather than on it. Which side of the two
+         * is the FRONT is whichever the engine's own test calls 0 - the only
+         * side a teleport fires from, which is what lets a player walk off a
+         * pad they have just arrived on. */
+        ox = FixedMul(FixedDiv(dy, len), PORTAL_STANDOFF * FRACUNIT);
+        oy = FixedMul(FixedDiv(-dx, len), PORTAL_STANDOFF * FRACUNIT);
+        if (P_PointOnLineSide(ld->v1->x + dx / 2 + ox,
+                              ld->v1->y + dy / 2 + oy, ld) != 0)
+        {
+            ox = -ox;
+            oy = -oy;
+        }
+        /* Along the line: the cells a player is standing in when their next
+         * step takes them across it. */
+        for (k = 0; k <= steps; k++)
+        {
+            fixed_t px = ld->v1->x + FixedMul(dx, (k << FRACBITS) / steps) + ox;
+            fixed_t py = ld->v1->y + FixedMul(dy, (k << FRACBITS) / steps) + oy;
+            int fx, fy;
+
+            if (cell_of(px, py, &fx, &fy) && walk[fy * grid_w + fx])
+            {
+                add_portal(fy * grid_w + fx, dest);
+            }
+        }
+    }
+    if (lines_seen > 0)
+    {
+        printf("API_Route: %d teleport lines, %d with a destination, %d jumps\n",
+               lines_seen, lines_resolved, portal_count);
+    }
+}
+
 static void build_edges(mobj_t *probe)
 {
     dropped_locked = 0;
@@ -1795,13 +1972,21 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
     free(visited);
     free(seen);
     free(cell_sector);
+    free(portal_first);
+    free(portal_to);
+    free(portal_next);
     walk = calloc(1, grid_w * grid_h);
     edges = calloc(1, grid_w * grid_h);
     visited = calloc(1, grid_w * grid_h);
     seen = calloc(1, grid_w * grid_h);
     cell_sector = malloc(sizeof(int) * grid_w * grid_h);
+    portal_first = malloc(sizeof(int) * grid_w * grid_h);
+    portal_to = malloc(sizeof(int) * grid_w * grid_h);
+    portal_next = malloc(sizeof(int) * grid_w * grid_h);
+    portal_count = 0;
     if (walk == NULL || edges == NULL || visited == NULL || seen == NULL
-        || cell_sector == NULL)
+        || cell_sector == NULL || portal_first == NULL || portal_to == NULL
+        || portal_next == NULL)
     {
         printf("API_Route: out of memory for a %dx%d grid\n", grid_w, grid_h);
         free(queue);
@@ -1839,6 +2024,7 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
     }
     build_ms = I_GetTimeMS();
     build_edges(probe);
+    build_portals();
     build_ms = I_GetTimeMS() - build_ms;
     /* Every step has to exist from both ends. A traverse between two points
      * is not bit-for-bit the same run in reverse, so asking the question from
@@ -2965,6 +3151,43 @@ cJSON *API_RouteDebug(mobj_t *player)
     cJSON_AddNumberToObject(root, "centerX", cell_x(cx) >> FRACBITS);
     cJSON_AddNumberToObject(root, "centerY", cell_y(cy) >> FRACBITS);
     cJSON_AddBoolToObject(root, "walkable", walk[at] != 0);
+    /* How many one-way jumps the grid has, and where the one under the
+     * player's feet goes. A teleporter the route does not know about is
+     * indistinguishable from a level the route simply cannot cross, and from
+     * outside the engine those want completely different things done. */
+    cJSON_AddNumberToObject(root, "teleports", portal_count);
+    if (portal_first != NULL && portal_first[at] >= 0)
+    {
+        int to = portal_to[portal_first[at]];
+        cJSON *t = cJSON_CreateObject();
+
+        cJSON_AddNumberToObject(t, "x", cell_x(to % grid_w) >> FRACBITS);
+        cJSON_AddNumberToObject(t, "y", cell_y(to / grid_w) >> FRACBITS);
+        cJSON_AddItemToObject(root, "stepsOnto", t);
+    }
+    /* Every jump the grid has: where stepping across a pad leaves from and
+     * where it lands. A caller can ask the way to either end, which is how
+     * "the route crosses a teleporter" is checkable from outside at all. */
+    if (portal_first != NULL)
+    {
+        cJSON *jumps = cJSON_CreateArray();
+        int k, i;
+
+        for (k = 0; k < grid_w * grid_h; k++)
+        {
+            for (i = portal_first[k]; i >= 0; i = portal_next[i])
+            {
+                cJSON *t = cJSON_CreateObject();
+
+                cJSON_AddNumberToObject(t, "fromX", cell_x(k % grid_w) >> FRACBITS);
+                cJSON_AddNumberToObject(t, "fromY", cell_y(k / grid_w) >> FRACBITS);
+                cJSON_AddNumberToObject(t, "x", cell_x(portal_to[i] % grid_w) >> FRACBITS);
+                cJSON_AddNumberToObject(t, "y", cell_y(portal_to[i] / grid_w) >> FRACBITS);
+                cJSON_AddItemToArray(jumps, t);
+            }
+        }
+        cJSON_AddItemToObject(root, "teleportsTo", jumps);
+    }
     cJSON_AddNumberToObject(root, "distance",
                             field[at] == ROUTE_UNREACHED ? -1 : field[at]);
 
@@ -3145,7 +3368,7 @@ static boolean route_bfs(mobj_t *player, route_goal_t want, void *ctx,
     int *queue, *parent;
     int i;
 
-    if (player == NULL || edges == NULL
+    if (player == NULL || edges == NULL || portal_first == NULL
         || !cell_of(player->x, player->y, &cx, &cy))
     {
         return false;
@@ -3182,6 +3405,22 @@ static boolean route_bfs(mobj_t *player, route_goal_t want, void *ctx,
             }
             ni = ny * grid_w + nx;
             if (parent[ni] != -2)
+            {
+                continue;
+            }
+            parent[ni] = at;
+            if (want(ni, ctx))
+            {
+                found = ni;
+                break;
+            }
+            queue[tail++] = ni;
+        }
+        for (d = portal_first[at]; d >= 0 && found < 0; d = portal_next[d])
+        {
+            int ni = portal_to[d];
+
+            if (!walk[ni] || parent[ni] != -2)
             {
                 continue;
             }
@@ -3293,6 +3532,13 @@ boolean API_RouteTo(mobj_t *player, fixed_t x, fixed_t y, api_route_t *out)
 {
     int gx, gy, goal;
 
+    if (player == NULL)
+    {
+        return false;
+    }
+    /* The only entry point that is not downstream of an observation, so it is
+     * the only one that can be the first thing asked of a level. */
+    ensure_built(player);
     if (edges == NULL || !cell_of(x, y, &gx, &gy))
     {
         return false;

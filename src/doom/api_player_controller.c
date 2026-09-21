@@ -411,6 +411,33 @@ api_response_t patchPlayer(cJSON *req, int playernum)
         }
     }
 
+    /* Put the player somewhere. What the game itself does at a teleporter,
+     * so the sector, the blockmap and everything else that indexes on
+     * position stay consistent - assigning x and y directly leaves the thing
+     * linked into the subsector it used to be in.
+     *
+     * For standing a player somewhere to ask a question about that place:
+     * whether a route leads on from it, what is in sight from it. Whether the
+     * spot can be REACHED is a different question, and one that would
+     * otherwise have to be answered before this one could be asked. */
+    val = cJSON_GetObjectItem(req, "position");
+    if (val)
+    {
+        cJSON *px = cJSON_GetObjectItem(val, "x");
+        cJSON *py = cJSON_GetObjectItem(val, "y");
+
+        if (!cJSON_IsNumber(px) || !cJSON_IsNumber(py))
+        {
+            return API_CreateErrorResponse(400, "position needs a numeric x and y");
+        }
+        if (player->mo == NULL
+            || !P_TeleportMove(player->mo, API_FloatToFixed(px->valuedouble),
+                               API_FloatToFixed(py->valuedouble)))
+        {
+            return API_CreateErrorResponse(409, "nothing fits there");
+        }
+    }
+
     flags = cJSON_GetObjectItem(req, "cheatFlags");
     if (flags)
     {
