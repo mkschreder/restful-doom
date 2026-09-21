@@ -1597,9 +1597,37 @@ api_response_t API_PostEpisode(cJSON *req)
     /* Nothing of the last episode's last decision carries into this one. */
     API_ReleaseControls();
 
-    // A snapshot of the episode that just ended would restore into this one,
-    // and the level it archives is not the level that will be standing.
-    API_SnapshotDiscardAll();
+    // A snapshot archives a LEVEL, so one taken in the episode that just
+    // ended restores perfectly well into another episode of the same level.
+    // It is only when the level changes that what it archives is not what
+    // will be standing.
+    //
+    // Discarding on every episode instead made an archive of held states
+    // unusable the moment a new episode began, which is precisely when a
+    // search that returns to somewhere it has already been needs it. Measured
+    // on E1M1: an archive of twenty-one cells carried into the next round and
+    // every single resume from it was refused, so the search restarted from
+    // the level's front door every round and found the same twenty-odd cells
+    // again. A search that cannot build on what it found is not a search.
+    //
+    // A scenario is a level built from a seed, so a new seed is a new level
+    // even under the same name.
+    {
+        static int held_episode = -1;
+        static int held_map = -1;
+        static unsigned int held_seed;
+        unsigned int seed = have_pending_seed ? (unsigned int)pending_seed : 0;
+        boolean built = Scenario_Active();
+
+        if (episode != held_episode || map != held_map
+            || (built && seed != held_seed))
+        {
+            API_SnapshotDiscardAll();
+            held_episode = episode;
+            held_map = map;
+            held_seed = seed;
+        }
+    }
 
     // Nor anything the player was carrying. An episode that ended in a death
     // already started clean, because the engine marks a dead player for
