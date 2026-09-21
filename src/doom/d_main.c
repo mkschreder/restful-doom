@@ -77,6 +77,7 @@
 
 #include "d_main.h"
 #include "api.h"
+#include "api_hud.h"
 
 //
 // D-DoomLoop()
@@ -299,6 +300,12 @@ void D_Display (void)
                           W_CacheLumpName (DEH_String("M_PAUSE"), PU_CACHE));
     }
 
+
+    // What the agent was shown and what it decided, over the finished view.
+    // Here, at the end of the video path, so it is the last thing written to
+    // the frame and reads no game state on the way: an overlaid run plays out
+    // tic for tic like a bare one.
+    API_Hud_Drawer ();
 
     // menus go directly to the screen
     M_Drawer ();          // menu is drawn even on top of everything

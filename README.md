@@ -31,6 +31,7 @@ between.
 | `POST /api/step` | apply actions, run exactly N tics, answer with the state that results |
 | `POST /api/episode` | restart a level reproducibly, seed included |
 | `GET /api/frame` | the 320x200 framebuffer and the palette in effect |
+| `POST /api/hud` | draw the observation, the options and the choice over the frame in the window; `DELETE` clears it |
 | `GET /api/map` | the walkable grid and the distance to the exit across it |
 | `GET /api/route` | the route's working at the player's own cell, when a bearing and a wall disagree |
 | `GET /api/world/movetest` | whether a body could stand at a point, and which of P_TryMove's rules says no |
