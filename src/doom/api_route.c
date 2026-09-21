@@ -2151,6 +2151,76 @@ static boolean seed_and_flood(mobj_t *probe, boolean allow_keys, int *queue,
         }
     }
 
+    /* Nothing to walk to and nowhere new to look: the level is waiting to be
+     * OPERATED.
+     *
+     * A room whose only way on is a switch on its wall answers every other
+     * question with "nothing". There is no exit to route to, no key in the
+     * way, no unseen ground with a step into it - the player has walked every
+     * inch of what it can reach and the level has not moved. Told nothing,
+     * the agent walks in circles until the decisions run out, which is what
+     * E1M8 did for its whole episode: it opens in a sealed chamber and had
+     * never once been played past it.
+     *
+     * The switch search above cannot help here. It exists to pick the ONE
+     * switch that leads out from the dozen that do not, so it needs the
+     * exit's own side of the level to compare against - and when the exit
+     * cannot be reached at all that side is empty and the search never runs.
+     * Nothing to compare against is not a reason to say nothing.
+     *
+     * So: the nearest place the player can stand and operate something. Fair
+     * play is preserved by construction, because a spot has to be REACHABLE
+     * to be a candidate and reachability is already confined to ground the
+     * player has seen. This cannot fire while any better goal exists; it is
+     * the answer of last resort, and the alternative to it is silence. */
+    /* Only on the pass that is allowed to want keys, which is the last one
+     * tried. A level whose exit is behind a locked door reaches here on its
+     * FIRST pass, with the key search still to come: taking the nearest
+     * switch there would answer a question nobody asked and stop the pass
+     * that would have found the key. Measured, doing this unconditionally
+     * sent six of the nine levels to a switch a few dozen units away instead
+     * of to the key that actually opens their way out. */
+    if (seed < 0 && allow_keys)
+    {
+        int best = -1, best_d = 0, j;
+
+        for (j = 0; j < numlines; j++)
+        {
+            line_t *ld = &lines[j];
+            fixed_t sx, sy;
+            int scx, scy, c;
+
+            if (ld->special == 0 || lock_of(ld) != 0)
+            {
+                continue;
+            }
+            if (!opener_spot(probe, ld, &sx, &sy) || !cell_of(sx, sy, &scx, &scy))
+            {
+                continue;
+            }
+            c = scy * grid_w + scx;
+            if (reachable[c] == ROUTE_UNREACHED)
+            {
+                continue;
+            }
+            if (best < 0 || reachable[c] < best_d)
+            {
+                best = c;
+                best_d = reachable[c];
+                route_switch_x = (ld->v1->x + ld->v2->x) / 2;
+                route_switch_y = (ld->v1->y + ld->v2->y) / 2;
+            }
+        }
+        if (best >= 0)
+        {
+            seed = best;
+            route_goal_switch = true;
+            printf("API_Route: nothing to walk to, so heading for something to "
+                   "operate at %d,%d\n", route_switch_x >> FRACBITS,
+                   route_switch_y >> FRACBITS);
+        }
+    }
+
     if (seed < 0)
     {
         int walkable_cells = 0, reached = 0;
