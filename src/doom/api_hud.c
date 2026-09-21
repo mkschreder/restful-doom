@@ -281,6 +281,26 @@ static void DrawGlyphIfOnScreen(int x, int y, patch_t *patch)
     V_DrawPatchDirect(x, y, patch);
 }
 
+// How wide a row will actually be drawn.
+//
+// The band behind a line is sized to its text rather than to the view. A full
+// width band per line turns a dozen lines into a panel over the whole screen,
+// and then the overlay is the only thing anybody can see - which defeats the
+// point of drawing it on the game rather than beside it.
+static int RowWidth(const char *text, int length)
+{
+    int i, w = 0;
+
+    for (i = 0; i < length; i++)
+    {
+        int index = toupper((unsigned char) text[i]) - HU_FONTSTART;
+
+        w += (index < 0 || index >= HU_FONTSIZE || hu_font[index] == NULL)
+                 ? 4 : SHORT(hu_font[index]->width);
+    }
+    return w;
+}
+
 // Draw one wrapped row, left aligned in the band, and stop at its right edge.
 static void DrawRow(const char *text, int length, int x, int y, int right)
 {
@@ -380,7 +400,15 @@ void API_Hud_Drawer(void)
         {
             int length = API_Hud_WrapPoint(text, glyph_width, right - left - 4);
 
-            FillClipped(left, y, right - left, step, colour);
+            {
+                int w = RowWidth(text, length) + 4;
+
+                if (w > right - left)
+                {
+                    w = right - left;
+                }
+                FillClipped(left, y, w, step, colour);
+            }
             DrawRow(text, length, left + 2, y + 1, right - 2);
             y += step;
 
