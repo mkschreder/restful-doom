@@ -1621,8 +1621,22 @@ void API_Agent_PerTic(void)
             {
                 // G_InitNew has already cleared these; move them to where the
                 // caller asked so two episodes with different seeds diverge.
-                rndindex = pending_seed & 0xff;
-                prndindex = (pending_seed >> 8) & 0xff;
+                //
+                // MIXED, not sliced. Taking the bytes straight out of the
+                // seed means seeds that differ only in their low bits share a
+                // gameplay phase entirely: a caller handing out twenty-four
+                // consecutive seeds - which is exactly what an evaluation
+                // block is - got twenty-four episodes whose P_Random started
+                // at the same place, and called them independent worlds.
+                //
+                // Knuth's multiplicative hash scatters the whole seed into
+                // every output bit, so consecutive seeds land unrelated.
+                {
+                    unsigned int h = (unsigned int)pending_seed * 2654435761u;
+
+                    prndindex = (int)((h >> 8) & 0xff);
+                    rndindex = (int)((h >> 20) & 0xff);
+                }
                 have_pending_seed = false;
             }
             if (pending_start_distance >= 0 && players[consoleplayer].mo != NULL)
