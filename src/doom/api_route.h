@@ -99,6 +99,23 @@ cJSON *API_RouteDebug(mobj_t *player);
 
 /* Where the player has been this episode, for the frontier search. */
 void API_RouteMarkVisited(mobj_t *player);
+
+/* Where the player has been, as bytes a snapshot can carry.
+ *
+ * This is PART OF THE WORLD as far as an agent is concerned, and leaving it
+ * out of a snapshot was a real defect rather than an omission of convenience.
+ * "The nearest ground nobody has looked at" is computed from it, so a restore
+ * that does not put it back answers that question using wherever every OTHER
+ * attempt happened to walk - the agent is pointed at a frontier that is not
+ * its own, and two runs of identical actions diverge. Returns the byte count
+ * and the grid it belongs to, or 0 when no grid is standing. */
+int API_RouteVisitedBytes(int *w, int *h);
+const unsigned char *API_RouteVisitedData(void);
+
+/* Put one back. Applied at once when a grid of that size is standing, and
+ * held until one is otherwise - a restore can arrive before the route has
+ * ever been asked anything, and then the grid does not exist yet. */
+void API_RouteRestoreVisited(const unsigned char *data, int w, int h);
 void API_RouteForgetVisited(void);
 
 // Throw away everything derived from the level that is standing: the grid,

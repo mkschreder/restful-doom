@@ -272,6 +272,30 @@ static void SampleInto(agent_snapshot_t *s)
     s->state = gamestate;
 }
 
+/* Forget what the world looked like a moment ago, and anything derived from
+ * it.
+ *
+ * For a snapshot restore. Events are DERIVED by comparing the world to how it
+ * was on the previous tic, so a restore - which moves the world bodily to
+ * some other moment - makes that comparison meaningless: health going back up
+ * reads as healing and going back down reads as damage, neither of which
+ * happened. Measured, the first observation after a return reported "took 1
+ * damage" at full health, and the same actions replayed from the level's own
+ * start did not - a divergence in what the agent READ, with the simulation
+ * itself bit-identical.
+ *
+ * Invalidating the baseline rather than re-taking it: the next tic samples
+ * the world and starts again from there, which is the same path a fresh
+ * episode takes and needs no second copy of the sampling logic. Queued events
+ * go too, for the same reason - they describe a timeline the restore has just
+ * left. */
+void API_Agent_Rebaseline(void)
+{
+    prev.valid = false;
+    event_count = 0;
+    events_dropped = 0;
+}
+
 static void DeriveEvents(void)
 {
     agent_snapshot_t now;

@@ -52,6 +52,48 @@ static boolean client_keepalive;
 // training run as well as the dominant content of its stdout.
 boolean api_verbose;
 
+/* Put the controller back the way a snapshot found it.
+ *
+ * `keys_down` is only the API's COUNTDOWN to releasing a key; the press
+ * itself lives in the game's own `gamekeydown`, which a savegame does not
+ * carry. Restoring the countdown alone therefore produces a controller that
+ * believes it is holding a key the game believes is up - and the first
+ * decision after a return does nothing where the one before it was still
+ * turning.
+ *
+ * Measured, snapshotting three tics into a 150-degree turn: continuing
+ * through finished the turn, and restoring that same snapshot and continuing
+ * did not turn at all, with every field of the savegame and the API's own
+ * countdowns identical at the moment of the restore.
+ *
+ * Posted as EVENTS rather than written into `gamekeydown` directly, so the
+ * game's own responder sees them the way it sees every other press.
+ *
+ * Only the keys that are actually HELD, and this is not an optimisation:
+ * Doom's event queue is a ring of MAXEVENTS, far fewer than NUMKEYS, so
+ * posting one event per key overflows it and drops most of what was posted -
+ * including, reliably, the few that mattered. Whatever was held BEFORE the
+ * restore is released by the caller first, so the pair is a full
+ * resynchronisation without ever holding more than a handful of events. */
+void API_RestoreControls(void)
+{
+    int i;
+
+    for (i = 0; i < NUMKEYS; i++)
+    {
+        if (keys_down[i] > 0)
+        {
+            event_t event;
+
+            event.type = ev_keydown;
+            event.data1 = i;
+            event.data2 = 0;
+            event.data3 = 0;
+            D_PostEvent(&event);
+        }
+    }
+}
+
 void API_AfterTic();
 boolean API_ParseRequest(char *buffer, int buffer_len, api_request_t *request);
 api_response_t API_RouteRequest(api_request_t request);

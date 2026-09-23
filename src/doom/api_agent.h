@@ -23,6 +23,10 @@ boolean API_Agent_Lockstep(void);
 // lockstep this is where the loop is handed to the API and blocks.
 void API_Agent_PerTic(void);
 
+/* Forget the previous-tic baseline events are derived from, and drop anything
+ * already derived. For a snapshot restore - see api_agent.c. */
+void API_Agent_Rebaseline(void);
+
 // Called from P_DamageMobj whenever the console player loses health, so that
 // a `hurt` or `death` event can name what did it. The EVENT is still derived
 // from the health diff, as every other event is; this only supplies the

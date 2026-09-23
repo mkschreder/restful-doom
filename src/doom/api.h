@@ -21,6 +21,16 @@ extern int keys_down[NUMKEYS];
 /* Drop every held key and any turn still in progress. Called when an episode
  * restarts, so the new one does not inherit the last decision of the old. */
 void API_ReleaseControls(void);
+
+/* Put the controller back the way a snapshot found it. See api.c. */
+void API_RestoreControls(void);
+
+/* Doom's accelerative-turn counter, which a snapshot has to carry: a turn
+ * gets faster the longer its key is held, so restoring the world and the
+ * press without it makes the first turn after a return a slow one. Defined
+ * in g_game.c beside the counter itself. */
+int API_TurnHeld(void);
+void API_SetTurnHeld(int held);
 extern int target_angle;
 
 void API_Init(int port);

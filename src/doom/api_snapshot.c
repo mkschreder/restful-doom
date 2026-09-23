@@ -10,6 +10,7 @@
 #include "api_snapshot.h"
 #include "api_cJSON.h"
 #include "api_route.h"
+#include "api_agent.h"
 
 #include "doomstat.h"
 #include "d_player.h"
@@ -148,6 +149,47 @@ static void write_extras(FILE *f)
 
         fwrite(&t, sizeof(int), 1, f);
     }
+
+    /* The API's own pending INPUT.
+     *
+     * `keys_down` is how many more tics each key is held for and
+     * `target_angle` is the turn servo's target; both deliberately carry
+     * across step calls, which is what lets one decision say "walk forward
+     * for eight tics" and mean it. They are therefore part of the state a
+     * decision is made from, and leaving them out of a snapshot meant a
+     * restore put the world back and left the CONTROLLER mid-press - so the
+     * first action after a return did something else.
+     *
+     * Measured: from a mid-sequence snapshot, replaying the same three
+     * actions continuously and after a restore ended 347 001 fixed-point
+     * units apart and facing 9 degrees differently, with every field the
+     * savegame carries identical at the moment of the restore. */
+    fwrite(&target_angle, sizeof(int), 1, f);
+    fwrite(keys_down, sizeof(int), NUMKEYS, f);
+    {
+        int held = API_TurnHeld();
+
+        fwrite(&held, sizeof(int), 1, f);
+    }
+
+    /* Where the player has walked. Part of the world as far as an agent is
+     * concerned: "the nearest ground nobody has looked at" is computed from
+     * it, so a restore that does not put it back answers that question using
+     * wherever every other attempt happened to go. Two runs of identical
+     * actions then diverge - measured, two map units by the sixteenth
+     * decision, growing until the option the run is trying to take is no
+     * longer on offer. */
+    {
+        int w = 0, h = 0;
+        int n = API_RouteVisitedBytes(&w, &h);
+
+        fwrite(&w, sizeof(int), 1, f);
+        fwrite(&h, sizeof(int), 1, f);
+        if (n > 0)
+        {
+            fwrite(API_RouteVisitedData(), 1, (size_t)n, f);
+        }
+    }
 }
 
 // Reads what `write_extras` wrote and puts it back on the restored world.
@@ -204,6 +246,41 @@ static boolean read_extras(FILE *f)
         sectors[i].soundtarget = (t >= 0 && t < n) ? order[t] : NULL;
     }
     free(order);
+
+    /* The API's pending input. See write_extras. */
+    if (fread(&target_angle, sizeof(int), 1, f) != 1) return false;
+    if (fread(keys_down, sizeof(int), NUMKEYS, f) != (size_t)NUMKEYS) return false;
+    {
+        int held;
+
+        if (fread(&held, sizeof(int), 1, f) != 1) return false;
+        API_SetTurnHeld(held);
+    }
+
+    /* The visited grid, written last. A snapshot taken before the route was
+     * ever asked anything has none, which is a grid of zero by zero rather
+     * than a failure. */
+    {
+        int w = 0, h = 0;
+        unsigned char *cells;
+
+        if (fread(&w, sizeof(int), 1, f) != 1) return false;
+        if (fread(&h, sizeof(int), 1, f) != 1) return false;
+        if (w <= 0 || h <= 0)
+        {
+            API_RouteRestoreVisited(NULL, 0, 0);
+            return true;
+        }
+        cells = malloc((size_t)w * h);
+        if (cells == NULL) return false;
+        if (fread(cells, 1, (size_t)w * h, f) != (size_t)w * h)
+        {
+            free(cells);
+            return false;
+        }
+        API_RouteRestoreVisited(cells, w, h);
+        free(cells);
+    }
     return true;
 }
 
@@ -254,6 +331,45 @@ api_response_t API_GetSim(void)
 
     cJSON_AddNumberToObject(out, "rndindex", rndindex);
     cJSON_AddNumberToObject(out, "prndindex", prndindex);
+    /* The player's motion at FULL precision.
+     *
+     * /api/state reports position in whole map units, which is the right
+     * resolution for an agent and the wrong one for asking whether two runs
+     * are the same run. A sixteenth of a unit of momentum is invisible there
+     * and is a couple of units of position twenty tics later - so a
+     * divergence that has already happened reads as agreement until it is
+     * too large to diagnose. These are the raw fixed-point values. */
+    if (players[0].mo != NULL)
+    {
+        cJSON *me = cJSON_CreateObject();
+
+        cJSON_AddNumberToObject(me, "x", players[0].mo->x);
+        cJSON_AddNumberToObject(me, "y", players[0].mo->y);
+        cJSON_AddNumberToObject(me, "z", players[0].mo->z);
+        cJSON_AddNumberToObject(me, "momx", players[0].mo->momx);
+        cJSON_AddNumberToObject(me, "momy", players[0].mo->momy);
+        cJSON_AddNumberToObject(me, "momz", players[0].mo->momz);
+        cJSON_AddNumberToObject(me, "angle", (double)players[0].mo->angle);
+        cJSON_AddNumberToObject(me, "viewz", players[0].viewz);
+        cJSON_AddNumberToObject(me, "bob", players[0].bob);
+        cJSON_AddItemToObject(out, "player", me);
+    }
+    cJSON_AddNumberToObject(out, "leveltime", leveltime);
+    /* The API's own pending input, which outlives a step by design and is
+     * therefore part of the state a decision is made from. */
+    cJSON_AddNumberToObject(out, "targetAngle", target_angle);
+    {
+        int held = 0;
+
+        for (i = 0; i < NUMKEYS; i++)
+        {
+            if (keys_down[i] > 0)
+            {
+                held++;
+            }
+        }
+        cJSON_AddNumberToObject(out, "keysHeld", held);
+    }
     for (th = thinkercap.next; th != &thinkercap; th = th->next)
     {
         if (th->function.acp1 == (actionf_p1)P_MobjThinker)
@@ -372,6 +488,14 @@ api_response_t API_PostSnapshotRestore(cJSON *req)
         return API_CreateErrorResponse(404, "nothing is held in that slot");
     }
 
+    /* Let go of whatever is being held on the way IN, before the snapshot's
+     * own countdowns overwrite the record of what that was. The press itself
+     * lives in the game's `gamekeydown`, which a savegame does not carry, so
+     * without this the game keeps holding a key the restored controller has
+     * no idea about. API_RestoreControls below presses back what the snapshot
+     * says, and the two together are a full resynchronisation. */
+    API_ReleaseControls();
+
     replay = fmemopen(slots[slot].data, slots[slot].len, "rb");
     if (replay == NULL)
     {
@@ -423,6 +547,15 @@ api_response_t API_PostSnapshotRestore(cJSON *req)
     // how much of the map had been seen, which is the whole reason a
     // snapshot exists rather than a replay.
     API_RouteInvalidate();
+    /* The countdowns came back with the snapshot; the game's own key state
+     * did not, because a savegame does not carry it. Whatever was held on
+     * the way IN was let go before the read (see above), so this presses
+     * back exactly what the snapshot says was held and the two are in step. */
+    API_RestoreControls();
+    /* Events are derived by comparing the world to the previous tic, and the
+     * world has just moved bodily to another moment - so the comparison would
+     * report damage and healing that never happened. */
+    API_Agent_Rebaseline();
 
     out = cJSON_CreateObject();
     cJSON_AddNumberToObject(out, "slot", slot);

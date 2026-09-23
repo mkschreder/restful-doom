@@ -197,6 +197,24 @@ static const struct
 
 static boolean  gamekeydown[NUMKEYS]; 
 static int      turnheld;		// for accelerative turning 
+
+// How long the turn key has been held, for a snapshot to carry.
+//
+// Doom accelerates a turn the longer its key is held, so this counter is part
+// of the state a decision plays out from - and it is not in a savegame,
+// because a savegame was never meant to continue a simulation. Restoring the
+// world and the key press without it makes the first turn after a return a
+// SLOW turn where the one before it was a fast one, and two runs of identical
+// inputs end facing different ways.
+int API_TurnHeld(void)
+{
+    return turnheld;
+}
+
+void API_SetTurnHeld(int held)
+{
+    turnheld = held;
+}
  
 static boolean  mousearray[MAX_MOUSE_BUTTONS + 1];
 static boolean *mousebuttons = &mousearray[1];  // allow [-1]

@@ -117,6 +117,11 @@ static int *portal_next;
 static int portal_count;
 /* Where the player has been this episode. */
 static unsigned char *visited;
+/* A visited grid handed back by a snapshot restore, waiting for a grid of
+ * matching size to put it in. See API_RouteRestoreVisited. */
+static unsigned char *pending_visited;
+static int pending_visited_w;
+static int pending_visited_h;
 static int grid_w, grid_h;
 static fixed_t grid_x0, grid_y0;
 static void *built_for;
@@ -2399,6 +2404,16 @@ static boolean build_field(mobj_t *probe, boolean allow_keys, boolean *no_seed)
     portal_to = malloc(sizeof(int) * grid_w * grid_h);
     portal_next = malloc(sizeof(int) * grid_w * grid_h);
     portal_count = 0;
+    /* A restore may have handed back a visited grid before this one existed,
+     * or for a differently sized one. Now that the grid is the size it is
+     * going to be, put it in. */
+    if (visited != NULL && pending_visited != NULL
+        && pending_visited_w == grid_w && pending_visited_h == grid_h)
+    {
+        memcpy(visited, pending_visited, (size_t)grid_w * grid_h);
+    }
+    free(pending_visited);
+    pending_visited = NULL;
     if (walk == NULL || edges == NULL || visited == NULL || seen == NULL
         || cell_sector == NULL || portal_first == NULL || portal_to == NULL
         || portal_next == NULL || locked_at == NULL || cell_floor == NULL
@@ -3763,6 +3778,51 @@ void API_RouteFairPlay(boolean on)
 boolean API_RouteIsFair(void)
 {
     return fair_play;
+}
+
+int API_RouteVisitedBytes(int *w, int *h)
+{
+    if (visited == NULL || grid_w <= 0 || grid_h <= 0)
+    {
+        return 0;
+    }
+    if (w != NULL) { *w = grid_w; }
+    if (h != NULL) { *h = grid_h; }
+    return grid_w * grid_h;
+}
+
+const unsigned char *API_RouteVisitedData(void)
+{
+    return visited;
+}
+
+void API_RouteRestoreVisited(const unsigned char *data, int w, int h)
+{
+    size_t n;
+
+    free(pending_visited);
+    pending_visited = NULL;
+    pending_visited_w = 0;
+    pending_visited_h = 0;
+    if (data == NULL || w <= 0 || h <= 0)
+    {
+        return;
+    }
+    n = (size_t)w * h;
+    if (visited != NULL && w == grid_w && h == grid_h)
+    {
+        memcpy(visited, data, n);
+        return;
+    }
+    /* The grid is not standing, or is the wrong size for this. Hold it until
+     * one is built - which is what happens on the next route request. */
+    pending_visited = malloc(n);
+    if (pending_visited != NULL)
+    {
+        memcpy(pending_visited, data, n);
+        pending_visited_w = w;
+        pending_visited_h = h;
+    }
 }
 
 void API_RouteForgetVisited(void)
